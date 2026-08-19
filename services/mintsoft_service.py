@@ -225,6 +225,9 @@ class MintsoftReturnService:
                 line_items = event_data.get("line_items", [])
                 return_identifier = line_items[0].get("tracking_number") # Si hay, es el tracking number
 
+                # Guardamos el tracking crudo (sin fallback) para usarlo en los Comments de cada item
+                return_tracking_number = (return_identifier or "").strip()
+
                 if return_identifier is None:
                     completed_at = event_data.get("completed_at")
                     customer_email = event_data["customer"].get("email")
@@ -271,13 +274,20 @@ class MintsoftReturnService:
                     else:
                         return_reason = 2
 
-                    external_return_data["ReturnItems"].append({
+                    return_item_data = {
                         "SKU": sku,
                         "ProductId": product_id,
                         "Quantity": item.get("quantity"),
                         "Action": "NONE",
                         "ReturnReasonId": return_reason,
-                    })
+                    }
+
+                    # Tracking del item, y si no tiene usamos el del return
+                    tracking_number = (item.get("tracking_number") or "").strip() or return_tracking_number
+                    if tracking_number:
+                        return_item_data["Comments"] = tracking_number
+
+                    external_return_data["ReturnItems"].append(return_item_data)
 
                 print(external_return_data)
                 external_return_id = self.client.create_external_return(data=external_return_data)
@@ -349,6 +359,10 @@ class MintsoftReturnService:
 
                 response = self.client.allocate_return_item_location(return_id, data)
                 self.logger.info(f"Allocated External Return Items to {location_id}: {response}")
+
+
+            response = self.client.confirm_return(return_id)
+            self.logger.info(f"Confirmed return {return_id}: {response}")
 
             return None
 

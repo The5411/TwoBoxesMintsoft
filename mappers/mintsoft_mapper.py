@@ -62,7 +62,7 @@ clients = [
   { "m_name": "Compania Fantastica", "m_id": 109, "tb_name": "compañía fantástica", "tb_rma_prov": "Work Capture", "warehouse_id": 3},
   { "m_name": "Elce Swim", "m_id": 55, "tb_name": "elce swim", "tb_rma_prov": "Work Capture", "warehouse_id": 3},
   { "m_name": "Pony Rider", "m_id": 29, "tb_name": "pony rider ecommerce", "tb_rma_prov": "Work Capture", "warehouse_id": 5},
-  { "m_name": "Mister Zimi", "m_id": 99, "tb_name": "mister zimi", "tb_rma_prov": "Work Capture", "warehouse_id": 5},
+  #{ "m_name": "Mister Zimi", "m_id": 99, "tb_name": "mister zimi", "tb_rma_prov": "Work Capture", "warehouse_id": 5},
   { "m_name": "Rita Row", "m_id": 73, "tb_name": "rita row ecommerce", "tb_rma_prov": "Work Capture", "warehouse_id": 5},
   { "m_name": "Vero Alfie", "m_id": 59, "tb_name": "vero alfie", "tb_rma_prov": "Work Capture", "warehouse_id": 3}
 ]
