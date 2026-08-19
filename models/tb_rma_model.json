@@ -1,0 +1,194 @@
+[
+  {
+    "id": "b00d0045-b3f9-4509-9ebf-53d599048b56",
+    "event_data": {
+      "links": {
+        "actions": null,
+        "portal": "https://portal.twoboxes.com/3pls/c3e7e5d6-bc4f-4108-8501-7e658b3b06d8/returns/37bfa5de-4bbd-4723-8aa0-cb6be3616f86",
+        "self": "https://api.twoboxes.io/api/v1/returns/37bfa5de-4bbd-4723-8aa0-cb6be3616f86"
+      },
+      "id": "37bfa5de-4bbd-4723-8aa0-cb6be3616f86",
+      "3pl": null,
+      "captured_rma": null,
+      "comments": null,
+      "completed_at": "2025-12-11T17:57:11.104871Z",
+      "customer": {
+        "email": "",
+        "first_name": null,
+        "full_name": null,
+        "last_name": null,
+        "tags": null
+      },
+      "grading_status": "complete",
+      "kind": "production",
+      "line_items": [
+        {
+          "links": {
+            "actions": null,
+            "portal": "https://portal.twoboxes.com/3pls/c3e7e5d6-bc4f-4108-8501-7e658b3b06d8/returns/37bfa5de-4bbd-4723-8aa0-cb6be3616f86/line-items/050f8e6d-3c8b-4476-96f0-b495c9845672",
+            "self": "https://api.twoboxes.io/api/v1/return-line-items/050f8e6d-3c8b-4476-96f0-b495c9845672"
+          },
+          "id": "050f8e6d-3c8b-4476-96f0-b495c9845672",
+          "barcode": null,
+          "captured_lpn": null,
+          "carrier": null,
+          "child_reason": null,
+          "comments": null,
+          "consolidation_code": null,
+          "consolidation_provider": null,
+          "disposition": "Return to Stock",
+          "expected_quantity": 1,
+          "expiration_date": null,
+          "graded_attributes": [
+            {
+              "id": "c5dacaba-45ef-4b2e-a89c-b050dc109e73",
+              "merchant_grading_attribute": {
+                "id": "55e45f5b-fa97-4285-b708-c002270c209b",
+                "grading_attribute": {
+                  "id": "3dd0ffb8-ba8e-4a2c-8d6d-9863812902a4",
+                  "title": "No defects"
+                },
+                "mga_type": "inspection",
+                "vas_definition": null
+              },
+              "vas_successful": false,
+              "photo_urls": null
+            }
+          ],
+          "grading_ended_at": null,
+          "return_line_item_grading_status": "",
+          "lot_code": null,
+          "lpn": "5s2hrx4opsaYTnGDvUgHH4",
+          "merchant": {
+            "id": "c597505e-a91a-44d7-aa24-bbfbf809e331"
+          },
+          "parent_reason": "Style issue",
+          "product_variant": {
+            "barcode": "840354712385",
+            "id": "043b3e95-b7dc-4146-b66d-55f0ea0360c8",
+            "name": "Racer Jacket | Taupe - Athletic / L",
+            "sku": "TBF1H1"
+          },
+          "put_away_bin": null,
+          "quantity": 1,
+          "rma_line_item_id": "3755941",
+          "site": {
+            "id": "27323e1a-b236-4a6f-8887-355d2996fa3b",
+            "name": "FBF13"
+          },
+          "sku": "TEST1",
+          "storefront_line_item_id": "3755941",
+          "storefront_order_id": null,
+          "storefront_order_name": null,
+          "storefront_order_number": null,
+          "storefront_product_id": null,
+          "storefront_variant_id": null,
+          "tracking_number": "1ZEW43670320580052",
+          "transform_sku": null,
+          "transform_upc": null,
+          "upc": null,
+          "work_capture": false
+        },
+        {
+          "links": {
+            "actions": null,
+            "portal": "https://portal.twoboxes.com/3pls/c3e7e5d6-bc4f-4108-8501-7e658b3b06d8/returns/37bfa5de-4bbd-4723-8aa0-cb6be3616f86/line-items/4c6f052f-46fe-4e16-9952-f9fac932b15c",
+            "self": "https://api.twoboxes.io/api/v1/return-line-items/4c6f052f-46fe-4e16-9952-f9fac932b15c"
+          },
+          "id": "4c6f052f-46fe-4e16-9952-f9fac932b15c",
+          "barcode": null,
+          "captured_lpn": null,
+          "carrier": null,
+          "child_reason": null,
+          "comments": null,
+          "consolidation_code": null,
+          "consolidation_provider": null,
+          "disposition": "Return to Stock",
+          "expected_quantity": 1,
+          "expiration_date": null,
+          "graded_attributes": [
+            {
+              "id": "fa9c3d7e-461f-45a7-87c9-9bc7252dc6e8",
+              "merchant_grading_attribute": {
+                "id": "55e45f5b-fa97-4285-b708-c002270c209b",
+                "grading_attribute": {
+                  "id": "3dd0ffb8-ba8e-4a2c-8d6d-9863812902a4",
+                  "title": "No defects"
+                },
+                "mga_type": "inspection",
+                "vas_definition": null
+              },
+              "vas_successful": false,
+              "photo_urls": null
+            }
+          ],
+          "grading_ended_at": null,
+          "return_line_item_grading_status": "",
+          "lot_code": null,
+          "lpn": "shBd9ZL2GNqiQNaf47vYAN",
+          "merchant": {
+            "id": "c597505e-a91a-44d7-aa24-bbfbf809e331"
+          },
+          "parent_reason": "Style issue",
+          "product_variant": {
+            "barcode": "840354712378",
+            "id": "f1b8214f-c304-45d5-baff-586284ce1fd8",
+            "name": "Racer Jacket | Taupe - Athletic / M",
+            "sku": "TBGX11"
+          },
+          "put_away_bin": null,
+          "quantity": 1,
+          "rma_line_item_id": "3755940",
+          "site": {
+            "id": "27323e1a-b236-4a6f-8887-355d2996fa3b",
+            "name": "TB Merchant"
+          },
+          "sku": "PRODUCT1",
+          "storefront_line_item_id": "3755940",
+          "storefront_order_id": null,
+          "storefront_order_name": null,
+          "storefront_order_number": null,
+          "storefront_product_id": null,
+          "storefront_variant_id": null,
+          "tracking_number": "1ZEW43670320580052",
+          "transform_sku": null,
+          "transform_upc": null,
+          "upc": null,
+          "work_capture": false
+        }
+      ],
+      "linked_line_items": [],
+      "merchant_integration": {
+        "id": "4a3fc423-7ff0-4725-99b6-f9e3ab91d012",
+        "merchant": {
+          "id": "c597505e-a91a-44d7-aa24-bbfbf809e331",
+          "name": "test client"
+        },
+        "name": "TB Site",
+        "site": {
+          "id": "27323e1a-b236-4a6f-8887-355d2996fa3b",
+          "name": "Two Boxes"
+        }
+      },
+      "return_provider": "webhooks",
+      "return_type": "rma",
+      "rma": "RMA0916317",
+      "rma_address": {
+        "address_1": "",
+        "address_2": null,
+        "city": null,
+        "company": null,
+        "country_code": null,
+        "phone_number": null,
+        "province_code": null,
+        "zip": ""
+      },
+      "rma_return_id": "40bffd8c-1ac5-4c7a-8c99-497f9630093b",
+      "rts": false,
+      "store_front_provider": "noop",
+      "undeliverable_shipping_charge": null,
+      "work_capture": false
+    },
+    "event_type": "return-complete"
+  }
+]

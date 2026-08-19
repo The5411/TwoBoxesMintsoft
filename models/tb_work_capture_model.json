@@ -1,0 +1,53 @@
+[
+  {
+  "id": "2b76f0ca-1a27-4ac8-83f6-9ebcf77bfa56",
+  "event_type": "return-complete",
+  "event_data": {
+    "id": "d35da52e-5dae-412f-bac6-68c2d1f66ef0",
+    "rma": "AyGU1PXUEHUgtGPo0J6W",
+    "grading_status": "complete",
+    "completed_at": "2026-03-09T22:20:04.810916Z",
+    "return_provider": "work-capture",
+    "customer": {
+      "full_name": "MELINDA ZOU",
+      "email": "",
+      "first_name": null,
+      "last_name": null
+    },
+    "3pl": {
+      "name": "5411"
+    },
+    "line_items": [
+      {
+        "id": "f81d1967-56d4-4367-aa72-2199ca7c23ed",
+        "sku": "FW25-06-OW-S",
+        "barcode": "9360072150944",
+        "product_variant": {
+          "name": "Tab Pant - Off White - S",
+          "sku": "FW25-06-OW-S"
+        },
+        "quantity": 1,
+        "disposition": "Return to Stock",
+        "put_away_bin": "DEIJI-RETURNS-118",
+        "tracking_number": "1ZY287C40316293924",
+        "storefront_order_number": "11781",
+        "merchant": {
+          "name": "Deiji Studios"
+        },
+        "site": {
+          "name": "5411 - Carrollton, TX"
+        },
+        "graded_attributes": [
+          {
+            "merchant_grading_attribute": {
+              "grading_attribute": {
+                "title": "No defects"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+]

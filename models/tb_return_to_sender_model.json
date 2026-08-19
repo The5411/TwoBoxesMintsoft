@@ -1,0 +1,194 @@
+[
+  {
+    "id": "39abed22-2831-4230-89a4-47a020a92f2a",
+    "event_data": {
+      "links": {
+        "actions": null,
+        "portal": "https://portal.twoboxes.com/3pls/522454da-0699-40c0-b822-634037de035a/returns/5d4f5441-95dd-4c59-a511-46aa0f3f79ff",
+        "self": "https://api.twoboxes.io/api/v1/returns/5d4f5441-95dd-4c59-a511-46aa0f3f79ff"
+      },
+      "id": "5d4f5441-95dd-4c59-a511-46aa0f3f79ff",
+      "3pl": null,
+      "captured_rma": null,
+      "comments": null,
+      "completed_at": "2025-12-10T19:02:33.689389Z",
+      "customer": {
+        "email": "",
+        "first_name": null,
+        "full_name": "<NAME>",
+        "last_name": null,
+        "tags": null
+      },
+      "grading_status": "complete",
+      "kind": "production",
+      "line_items": [
+        {
+          "links": {
+            "actions": null,
+            "portal": "https://portal.twoboxes.com/3pls/522454da-0699-40c0-b822-634037de035a/returns/5d4f5441-95dd-4c59-a511-46aa0f3f79ff/line-items/6bf85ba6-c779-4e27-8ade-eb3c2322b966",
+            "self": "https://api.twoboxes.io/api/v1/return-line-items/6bf85ba6-c779-4e27-8ade-eb3c2322b966"
+          },
+          "id": "6bf85ba6-c779-4e27-8ade-eb3c2322b966",
+          "barcode": "840255208499",
+          "captured_lpn": null,
+          "carrier": null,
+          "child_reason": null,
+          "comments": null,
+          "consolidation_code": null,
+          "consolidation_provider": null,
+          "disposition": "Return to Stock",
+          "expected_quantity": 1,
+          "expiration_date": null,
+          "graded_attributes": [
+            {
+              "id": "26c56fc1-763f-47ff-8380-a5fb9cb69514",
+              "merchant_grading_attribute": {
+                "id": "6a55e45f-bf45-4199-aa5f-49d5d262e182",
+                "grading_attribute": {
+                  "id": "3dd0ffb8-ba8e-4a2c-8d6d-9863812902a4",
+                  "title": "No defects"
+                },
+                "mga_type": "inspection",
+                "vas_definition": null
+              },
+              "vas_successful": false,
+              "photo_urls": null
+            }
+          ],
+          "grading_ended_at": null,
+          "return_line_item_grading_status": "",
+          "lot_code": null,
+          "lpn": "qNkK7vTJ92ydemZP3Zg4w6",
+          "merchant": {
+            "id": "79d09c6f-b724-4433-84c0-08b33da57741"
+          },
+          "parent_reason": null,
+          "product_variant": {
+            "barcode": "840255208499",
+            "id": "2242d3ed-fb0c-4e06-884a-6df5e178cb14",
+            "name": "The Fontelina - Long Sleeve Linen Shirt - White / XL",
+            "sku": "TB-FTA-XL"
+          },
+          "put_away_bin": "KF-RP-3-G",
+          "quantity": 1,
+          "rma_line_item_id": "a721d509-0f7c-41d7-ae8d-6292d3f8b262",
+          "site": {
+            "id": "5b85d8bb-4f22-4515-bb40-3e1e652ffa2f",
+            "name": "TB01"
+          },
+          "sku": "TB01-FTA-XL",
+          "storefront_line_item_id": "",
+          "storefront_order_id": null,
+          "storefront_order_name": null,
+          "storefront_order_number": "kf414857",
+          "storefront_product_id": null,
+          "storefront_variant_id": null,
+          "tracking_number": "LK246182676AU",
+          "transform_sku": null,
+          "transform_upc": null,
+          "upc": null,
+          "work_capture": true
+        },
+        {
+          "links": {
+            "actions": null,
+            "portal": "https://portal.twoboxes.com/3pls/522454da-0699-40c0-b822-634037de035a/returns/5d4f5441-95dd-4c59-a511-46aa0f3f79ff/line-items/95182df5-d64b-447b-969b-f995612a4fe7",
+            "self": "https://api.twoboxes.io/api/v1/return-line-items/95182df5-d64b-447b-969b-f995612a4fe7"
+          },
+          "id": "95182df5-d64b-447b-969b-f995612a4fe7",
+          "barcode": "840255246101",
+          "captured_lpn": null,
+          "carrier": null,
+          "child_reason": null,
+          "comments": null,
+          "consolidation_code": null,
+          "consolidation_provider": null,
+          "disposition": "Return to Stock",
+          "expected_quantity": 1,
+          "expiration_date": null,
+          "graded_attributes": [
+            {
+              "id": "df510a34-a8d1-4965-b88d-11bc6f8f8da2",
+              "merchant_grading_attribute": {
+                "id": "2477a0c0-59e1-4dbb-9022-12a109ab880f",
+                "grading_attribute": {
+                  "id": "3dd0ffb8-ba8e-4a2c-8d6d-9863812902a4",
+                  "title": "No defects"
+                },
+                "mga_type": "inspection",
+                "vas_definition": null
+              },
+              "vas_successful": false,
+              "photo_urls": null
+            }
+          ],
+          "grading_ended_at": null,
+          "return_line_item_grading_status": "",
+          "lot_code": null,
+          "lpn": "jhmP7bko7Lqn89UmpfJWcB",
+          "merchant": {
+            "id": "79d09c6f-b724-4433-84c0-08b33da57741"
+          },
+          "parent_reason": null,
+          "product_variant": {
+            "barcode": "840255246101",
+            "id": "46c2d9a6-28c7-403d-bba0-51acf5184373",
+            "name": "The Bossitano - Swim Trunks - White / M / Short 4.5\"",
+            "sku": "TB-LMN-M"
+          },
+          "put_away_bin": "TB-RP-1-Y",
+          "quantity": 1,
+          "rma_line_item_id": "9a8a2f11-37d6-4a31-a396-da6574c8e414",
+          "site": {
+            "id": "5b85d8bb-4f22-4515-bb40-3e1e652ffa2f",
+            "name": "TB01"
+          },
+          "sku": "TRKE-LMN-M",
+          "storefront_line_item_id": "",
+          "storefront_order_id": null,
+          "storefront_order_name": null,
+          "storefront_order_number": "kf414857",
+          "storefront_product_id": null,
+          "storefront_variant_id": null,
+          "tracking_number": "LK246182676AU",
+          "transform_sku": null,
+          "transform_upc": null,
+          "upc": null,
+          "work_capture": true
+        }
+      ],
+      "linked_line_items": [],
+      "merchant_integration": {
+        "id": "ea596351-11ca-46c8-b562-bf8c9905ac35",
+        "merchant": {
+          "id": "79d09c6f-b724-4433-84c0-08b33da57741",
+          "name": "Kenny Flowers"
+        },
+        "name": "Two_Boxwa",
+        "site": {
+          "id": "5b85d8bb-4f22-4515-bb40-3e1e652ffa2f",
+          "name": "TB01"
+        }
+      },
+      "return_provider": "work-capture",
+      "return_type": "rts",
+      "rma": "GBESeTiWJ8DmAB8FSLLG",
+      "rma_address": {
+        "address_1": "<ADDRESS>",
+        "address_2": null,
+        "city": "capalaba qld",
+        "company": null,
+        "country_code": null,
+        "phone_number": null,
+        "province_code": "aus",
+        "zip": "<ZIP_CODE>"
+      },
+      "rma_return_id": "",
+      "rts": true,
+      "store_front_provider": "noop",
+      "undeliverable_shipping_charge": 10.35,
+      "work_capture": true
+    },
+    "event_type": "return-complete"
+  }
+]

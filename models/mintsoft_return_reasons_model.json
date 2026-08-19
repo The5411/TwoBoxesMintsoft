@@ -1,0 +1,31 @@
+[
+    {
+        "Name": "Unwanted - Good Stock", 
+        "StockAction": "DoNothing", 
+        "Active": true, 
+        "ID": 1, 
+        "LastUpdated": "2015-10-24T20:38:33.9348829", 
+        "LastUpdatedByUser": "mark.super"
+    }, {
+        "Name": "Faulty or Damaged - Quarantine Stock", 
+        "StockAction": "Quarantine", 
+        "Active": true, 
+        "ID": 2, 
+        "LastUpdated": "2015-10-24T20:39:02.4241657", 
+        "LastUpdatedByUser": "mark.super"
+    }, {
+        "Name": "Discard - Scrap Stock", 
+        "StockAction": "Scrap", 
+        "Active": true, 
+        "ID": 3, 
+        "LastUpdated": "2024-07-25T23:57:29.7429773", 
+        "LastUpdatedByUser": "will.hammond.super"
+    }, {
+        "Name": "Dry Cleaning", 
+        "StockAction": "Quarantine", 
+        "Active": true, 
+        "ID": 4, 
+        "LastUpdated": "2026-02-09T19:29:20.1602712", 
+        "LastUpdatedByUser": "jcordero@the5411.com"
+    }
+]
