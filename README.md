@@ -23,7 +23,7 @@ correcta del depósito y moviéndolo a la caja física que usó el operario.
   - [Return interno vs externo](#return-interno-vs-externo)
   - [Disposition → return reason → ubicación](#disposition--return-reason--ubicación)
   - [Manejo de cajas (put-away bin)](#manejo-de-cajas-put-away-bin)
-  - [Reintento de recuperación Barcode → SKU](#reintento-de-recuperación-barcode--sku)
+  - [Fallback Barcode → SKU y la limitación de `SearchBarcode`](#fallback-barcode--sku-y-la-limitación-de-searchbarcode)
 - [Endpoints de la API de Mintsoft utilizados](#endpoints-de-la-api-de-mintsoft-utilizados)
 - [Manejo de errores](#manejo-de-errores)
 - [Logging](#logging)
@@ -284,17 +284,48 @@ escaneó el operario (`put_away_bin`):
    la ubicación `RET` / `RET-TEMP` correspondiente, `autoGenerateSSCC=false`).
 3. `PUT /api/Warehouse/TransferStock` desde `RET`/`RET-TEMP` → código de la caja.
 
-### Reintento de recuperación Barcode → SKU
+### Fallback Barcode → SKU y la limitación de `SearchBarcode`
 
-Si `create_return` lanza una excepción, todos los line items se consideran fallidos y el
-servicio intenta una pasada de recuperación:
+Two Boxes a veces manda un `sku` que en Mintsoft no existe con ese valor exacto (el SKU real
+está cargado distinto, o el operario escaneó una variante). Para esos casos
+`MintsoftOrderClient.get_product_id` (`clients/mintsoftClient.py:252`) tiene un fallback: si la
+búsqueda por SKU no encontró producto, reintenta resolviendo el **barcode** a un SKU vía
+`GET /api/Product/SearchBarcode`, y si eso devuelve algo usa ese SKU para volver a buscar el
+producto.
 
-- Para cada item fallido con un `barcode` de **7 o más caracteres**, llama a
-  `GET /api/Product/SearchBarcode` y sobreescribe `item["sku"]` con el SKU resuelto.
-- Si **todos** los barcodes se resolvieron y es el primer intento, se reintenta `create_return`
-  una vez (`_retried=True`).
-- Si algún barcode no se puede resolver, el error reportado pasa a ser **E-02**
-  (`SKU_NOT_RESOLVABLE`) en lugar del genérico **E-03**.
+```python
+if product_id == None and len(barcode) > 7:
+    sku_rety = self.get_sku_dado_barcode(barcode)
+    if sku_rety == "null":
+        return sku, None
+```
+
+**Por qué el `len(barcode) > 7`.** Es una limitación del endpoint `SearchBarcode` de Mintsoft:
+con barcodes cortos (7 caracteres o menos) el endpoint no se comporta como una búsqueda exacta
+y devuelve matches por prefijo/parcial, es decir el SKU de **otro** producto. Un SKU equivocado
+es peor que ningún SKU: el return se crearía contra un producto real distinto y el stock
+devuelto quedaría sumado en el lugar equivocado, sin ningún error visible. Por eso el guard
+corta antes de llamar al endpoint y el fallback solo se intenta cuando el barcode es lo bastante
+largo para que la búsqueda sea confiable (EAN-13, UPC-A, etc.).
+
+**Qué pasa con los casos que caen acá.** Si el barcode tiene 7 caracteres o menos, `get_product_id`
+devuelve `(sku, None)` sin intentar el fallback, y el flujo sigue con `product_id = None`:
+
+- **Return externo** (`create_return`, `services/mintsoft_service.py:247`): se crea un producto
+  nuevo al vuelo con `PUT /api/Product`, así que en Mintsoft aparece un producto duplicado con el
+  SKU que mandó Two Boxes.
+- **Return interno** (`add_return_items`): el item se agrega con `ProductId: None`.
+
+En ninguno de los dos casos el proceso se detiene ni se reporta un error de SKU específico
+(no hay un código tipo `SKU_NOT_RESOLVABLE`). **Estos casos se corrigen a mano en Mintsoft**: nos
+llegan por mail (aviso del merchant / del equipo de depósito), se identifica el SKU real y se
+arregla el return y el stock manualmente. Es un volumen bajo y asumido — la alternativa sería
+mandar el barcode corto a `SearchBarcode` y arriesgarse a imputar el return al producto
+equivocado, que es un error mucho más difícil de detectar después.
+
+> ⚠️ El `len(barcode)` explota con `TypeError` si el line item no trae `barcode` (`None`).
+> En `add_return_items` la excepción se captura y el item se saltea; en `create_return` sube y
+> hace fallar el return completo.
 
 ---
 
@@ -328,6 +359,10 @@ API key devuelta se envía en el header `ms-apikey` en cada llamada. Todos los t
 `get_product_id` exige coincidencia **exacta** de SKU *y* que coincida el `ClientId` — la
 búsqueda de Mintsoft es difusa, así que un match por substring de otro cliente se ignora
 deliberadamente.
+
+`SearchBarcode` solo se llama con barcodes de **más de 7 caracteres**: con barcodes cortos el
+endpoint matchea parcialmente y devuelve el SKU de otro producto. Ver
+[Fallback Barcode → SKU](#fallback-barcode--sku-y-la-limitación-de-searchbarcode).
 
 Los helpers `get_warehouse_locations` / `get_products_in_locations` / `get_currencies` escriben
 la respuesta en un archivo JSON en el CWD del proceso; son herramientas de desarrollo para
@@ -454,6 +489,12 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
     `mappers/return_reason_mapper.py` está vacío.
 14. **Los ids de ubicación, de warehouse y de return reason están hardcodeados.** Si se
     renombran o recrean ubicaciones en Mintsoft, hay que editar `services/mintsoft_service.py`.
+15. **Los items con barcode de 7 caracteres o menos y SKU no encontrado se arreglan a mano.** El
+    fallback `SearchBarcode` está deshabilitado a propósito para esos casos por una limitación del
+    endpoint de Mintsoft (matchea parcial y devuelve el producto equivocado). El return se crea
+    igual — con un producto duplicado si es externo, o con `ProductId: None` si es interno — y la
+    corrección se hace manualmente en Mintsoft a partir del aviso que nos llega por mail. Ver
+    [Fallback Barcode → SKU](#fallback-barcode--sku-y-la-limitación-de-searchbarcode).
 
 ### Agregar un merchant
 
