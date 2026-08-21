@@ -199,7 +199,8 @@ Se soportan dos formas de payload. Los ejemplos completos están en `models/`
 | `event_data.line_items[0].tracking_number` | Referencia principal del return / `Reference` (truncado a 50 caracteres) |
 | `event_data.completed_at` + `event_data.customer.email` | Referencia de fallback `"{completed_at}-{email}"` cuando no hay tracking number |
 | `line_items[].sku` | Búsqueda del producto en Mintsoft |
-| `line_items[].barcode` | `EAN` al crear el producto; recuperación barcode→SKU |
+| `line_items[].barcode` | `EAN` al crear el producto; fallback barcode→SKU |
+| `line_items[].product_variant.barcode` | Fallback del barcode — en los payloads de RMA `line_items[].barcode` viene `null` y el barcode real está acá (`_get_item_barcode`) |
 | `line_items[].product_variant.name` | `Name` del producto cuando se crea uno inexistente |
 | `line_items[].quantity` | Cantidad del item del return |
 | `line_items[].disposition` | Determina return reason, ubicación y cuarentena (ver abajo) |
@@ -325,6 +326,11 @@ búsqueda por SKU no encontró producto, reintenta resolviendo el **barcode** a 
 `GET /api/Product/SearchBarcode`, y si eso devuelve algo usa ese SKU para volver a buscar el
 producto.
 
+El barcode se saca con `_get_item_barcode` (`services/mintsoft_service.py`), que mira
+`line_items[].barcode` y, si viene `null`, `line_items[].product_variant.barcode`: **en los
+payloads de RMA el barcode de nivel item viene siempre `null`** y el real está en el
+`product_variant` (ver `models/tb_rma_model.json`).
+
 ```python
 if product_id == None and len(barcode) > 7:
     sku_rety = self.get_sku_dado_barcode(barcode)
@@ -355,9 +361,10 @@ arregla el return y el stock manualmente. Es un volumen bajo y asumido — la al
 mandar el barcode corto a `SearchBarcode` y arriesgarse a imputar el return al producto
 equivocado, que es un error mucho más difícil de detectar después.
 
-> ⚠️ El `len(barcode)` explota con `TypeError` si el line item no trae `barcode` (`None`).
-> En `add_return_items` la excepción se captura y el item se saltea; en `create_return` sube y
-> hace fallar el return completo.
+> El `barcode` se normaliza a string antes de medirlo. Cuando venía `None`, `len(barcode)`
+> lanzaba `TypeError: object of type 'NoneType' has no len()`; en `add_return_items` esa
+> excepción se capturaba y **el item se caía del return en silencio** (return corto o vacío), y
+> en `create_return` hacía fallar el return completo.
 
 ---
 
@@ -508,11 +515,12 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
    `add_return_items` (dos veces) y `reallocate_return_items` — sin ningún cacheo.
 8. **`get_product_id` arma una URL con doble slash** (`…co.uk//api/Product/Search`), que
    Mintsoft acepta igual.
-9. **`reallocate_return_items` devuelve el último `response`**, por lo que lanza
-   `UnboundLocalError` si `line_items` está vacío (o si todos los items se saltean por no traer
-   `put_away_bin`); además re-lanza la excepción, mientras que `add_return_items` la absorbe.
-   Como re-lanza, cualquier fallo en un item **aborta la reasignación de los items siguientes** y
-   ese stock queda en `RET` / `RET-TEMP`.
+9. **`reallocate_return_items` acumula las respuestas en una lista** y la devuelve. Antes
+   devolvía la variable `response` del último item del loop, así que lanzaba
+   `UnboundLocalError` cuando no se procesaba ningún item (`line_items` vacío, o todos salteados
+   por no traer `put_away_bin`). Sigue re-lanzando las excepciones, mientras que
+   `add_return_items` las absorbe — o sea que un fallo en un item **aborta la reasignación de los
+   items siguientes** y ese stock queda en `RET` / `RET-TEMP`.
 10. **`allocate_external_return_items` sobreescribe el parámetro `data`** dentro de su loop; el
     manejador de errores se protege de eso con un chequeo de `isinstance` / `"event_data" in data`.
 11. **El manejador de errores de `add_return_items` referencia `new_identifier`**, que queda sin
@@ -529,6 +537,17 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
     igual — con un producto duplicado si es externo, o con `ProductId: None` si es interno — y la
     corrección se hace manualmente en Mintsoft a partir del aviso que nos llega por mail. Ver
     [Fallback Barcode → SKU](#fallback-barcode--sku-y-la-limitación-de-searchbarcode).
+16. **`add_return_items` confirma el return incluso si se cayeron items.** Un item se cae si no
+    tiene SKU o si falla la búsqueda del producto. Antes eso era un `continue` silencioso: el
+    return quedaba con menos unidades de las que devolvió el cliente — o **vacío**, si se caían
+    todas. Ahora los items caídos se juntan y, al final, se loguea un error y se manda un mail de
+    alerta con el detalle (`items_agregados` / `items_en_el_payload` / `items_caidos`). El return
+    igual queda confirmado y corto: la corrección es manual.
+17. **No hay idempotencia.** `create_return` nunca chequea si ya existe un return en Mintsoft para
+    esa orden o ese tracking number. Si Two Boxes manda dos eventos `return-complete` para el
+    mismo return físico — o reintenta una entrega — se crean **dos returns separados** en Mintsoft.
+    Como los payloads de RMA traen varios `line_items` con el mismo `tracking_number` y los de
+    Work Capture traen uno solo, dos eventos para el mismo return físico es un escenario real.
 
 ### Agregar un merchant
 

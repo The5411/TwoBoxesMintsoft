@@ -268,6 +268,11 @@ class MintsoftOrderClient:
 
         print(f"Product ID for SKU {sku} (ClientId {client_id}): {product_id}")
 
+        # barcode puede venir None (los payloads de RMA no traen line_items[].barcode),
+        # asi que se normaliza antes de medirlo: antes esto reventaba con
+        # "TypeError: object of type 'NoneType' has no len()" y el item se perdia.
+        barcode = str(barcode).strip() if barcode is not None else ""
+
         if product_id == None and len(barcode) > 7:
             sku_rety = self.get_sku_dado_barcode(barcode)
             # Sku ret

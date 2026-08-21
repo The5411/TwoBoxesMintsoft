@@ -29,6 +29,20 @@ def _normalize_order_number(value) -> str:
     return str(value or "").strip().lstrip("#").strip().upper()
 
 
+def _get_item_barcode(item) -> Optional[str]:
+    """Barcode de un line item de Two Boxes.
+
+    Los payloads de RMA traen line_items[].barcode en null y el barcode real vive en
+    line_items[].product_variant.barcode (ver models/tb_rma_model.json), asi que hay
+    que mirar los dos lugares. Devuelve None si no hay ninguno.
+    """
+    item = item or {}
+    for candidate in (item.get("barcode"), (item.get("product_variant") or {}).get("barcode")):
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return None
+
+
 class MintsoftReturnService:
     def __init__(self, logger_name: str = "mintsoft_service", log_file: str = "m_service.log"):
         self.logger = get_logger(logger_name, log_file)
@@ -140,6 +154,22 @@ class MintsoftReturnService:
         except Exception:
             return None
 
+    def _get_return_identifier(self, data) -> Optional[str]:
+        """Referencia del return para los reportes de error: tracking_number del primer
+        line item, y si no hay, "{completed_at}-{email del cliente}"."""
+        try:
+            event_data = data.get("event_data") or {}
+            line_items = event_data.get("line_items") or []
+            if line_items:
+                tracking = (line_items[0] or {}).get("tracking_number")
+                if tracking:
+                    return tracking
+            completed_at = event_data.get("completed_at", "")
+            customer_email = (event_data.get("customer") or {}).get("email", "")
+            return f"{completed_at}-{customer_email}"
+        except Exception:
+            return None
+
     def fetch_mintsoft_orders(self, data) -> List[Dict]:
         self.logger.info("Starting to fetch Mintsoft orders")
 
@@ -242,7 +272,8 @@ class MintsoftReturnService:
                 }
                 for item in line_items:
                     sku = item.get("sku")
-                    sku, product_id = self.client.get_product_id(sku, client_id, item.get("barcode"))
+                    barcode = _get_item_barcode(item)
+                    sku, product_id = self.client.get_product_id(sku, client_id, barcode)
 
                     if product_id == None:
                         # Si el item no existe en Mintsoft con ese SKU
@@ -250,7 +281,7 @@ class MintsoftReturnService:
                         new_product_data = {
                             "SKU": sku,
                             "Name": (item.get("product_variant") or {}).get("name") or item.get("sku"),
-                            "EAN": item.get("barcode"),
+                            "EAN": barcode,
                             "ClientId": client_id,
                         }
 
@@ -403,6 +434,10 @@ class MintsoftReturnService:
             # Guardaremos el (ReturnItemId, item, location_id) para allocarlos luego
             items_to_allocate = []
 
+            # Items que se caen del return sin abortarlo. Se reportan al final: un return
+            # con menos unidades de las que devolvio el cliente tiene que ser visible.
+            dropped_items = []
+
             # Step 1: Add items to the return
             for item in line_items:
                 disposition = item.get("disposition")
@@ -415,13 +450,15 @@ class MintsoftReturnService:
                 sku = (item.get("sku") or "").strip()
                 if not sku:
                     self.logger.warning("Skipping line item with missing or empty SKU")
+                    dropped_items.append({"sku": None, "motivo": "line item sin SKU"})
                     continue
 
                 product_id = None
                 try:
-                    sku, product_id = self.client.get_product_id(sku, client_id, item.get("barcode"))
+                    sku, product_id = self.client.get_product_id(sku, client_id, _get_item_barcode(item))
                 except Exception as e:
-                    self.logger.error(f"Error al obtener product_id para SKU {sku}: {e}")
+                    self.logger.error(f"Error al obtener product_id para SKU {sku}: {e}", exc_info=True)
+                    dropped_items.append({"sku": sku, "motivo": f"{type(e).__name__}: {e}"})
                     continue
 
                 if disposition == "Return to Stock":
@@ -496,6 +533,31 @@ class MintsoftReturnService:
             response = self.client.confirm_return(return_id)
             self.logger.info(f"Confirmed return {return_id}: {response}")
 
+            # El return quedo confirmado igual, pero si se cayeron items quedo corto
+            # (o vacio, si se cayeron todos). Hay que avisar para corregirlo a mano.
+            if dropped_items:
+                detalle = ", ".join(
+                    f"{d['sku']} ({d['motivo']})" for d in dropped_items
+                )
+                self.logger.error(
+                    f"Return {return_id} confirmado con {len(items_to_allocate)} de "
+                    f"{len(line_items)} items. Items caidos: {detalle}"
+                )
+                self._send_error_email(
+                    method="add_return_items",
+                    error=RuntimeError(
+                        f"Return {return_id} confirmado incompleto: "
+                        f"{len(items_to_allocate)} de {len(line_items)} items"
+                    ),
+                    order_reference=self._get_return_identifier(data),
+                    context={
+                        "return_id": return_id,
+                        "items_agregados": len(items_to_allocate),
+                        "items_en_el_payload": len(line_items),
+                        "items_caidos": dropped_items,
+                    },
+                )
+
             return None
 
         except Exception as e:
@@ -526,10 +588,16 @@ class MintsoftReturnService:
         event_data = data.get("event_data")
         line_items = event_data.get("line_items", [])
 
+        # Respuestas de los transfers que si se hicieron. Antes se devolvia la variable
+        # `response` del ultimo item del loop, asi que si no se procesaba ningun item
+        # (line_items vacio, o todos salteados por no traer put_away_bin) el return
+        # explotaba con UnboundLocalError.
+        responses = []
+
         try:
             for item in line_items:
                 sku = item.get("sku")
-                sku, product_id = self.client.get_product_id(sku, client_id, item.get("barcode"))
+                sku, product_id = self.client.get_product_id(sku, client_id, _get_item_barcode(item))
                 merchant = self._get_merchant_name(data)
                 warehouse = map_warehouse(merchant) # 3 si es Wholesale, 5 si es E-Comm
                 carton_code = item.get("put_away_bin")
@@ -576,6 +644,7 @@ class MintsoftReturnService:
                         self.client.create_carton(carton_data, client_id)
 
                     response = self.client.transfer_stock(reallocation_data)
+                    responses.append(response)
                     print(response)
 
                 else: # Stock a mandar a cuarentena
@@ -621,30 +690,29 @@ class MintsoftReturnService:
                     self.logger.info(f"{sku} from Return set to Quarantine at Location: {item.get("put_away_bin")}")
 
                     response = self.client.transfer_stock(reallocation_data)
+                    responses.append(response)
                     print(response)
 
 
-            return response
+            if line_items and not responses:
+                self.logger.warning(
+                    f"No se reasigno ningun item de los {len(line_items)} del payload "
+                    f"(ninguno traia put_away_bin): el stock quedo en RET / RET-TEMP"
+                )
+
+            return responses
 
         except Exception as e:
             self.logger.error(f"Error reallocating return items: {e}", exc_info=True)
-            event_data = data["event_data"]
-            line_items = event_data.get("line_items", [])
-            return_identifier = line_items[0].get("tracking_number") # Si hay, es el tracking number
-
-            if return_identifier is None:
-                completed_at = event_data.get("completed_at")
-                customer_email = event_data["customer"].get("email")
-                new_identifier = f"{completed_at}-{customer_email}"
-                return_identifier = new_identifier
-
             self._send_error_email(
                 method="reallocate_return_items",
                 error=e,
-                order_reference=return_identifier,
+                order_reference=self._get_return_identifier(data),
                 context={
                     "merchant_name": merchant_name,
                     "client_id": client_id,
+                    "items_reasignados": len(responses),
+                    "items_en_el_payload": len(line_items),
                 },
             )
             raise
