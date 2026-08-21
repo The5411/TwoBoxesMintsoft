@@ -299,22 +299,75 @@ class MintsoftOrderClient:
     
 
     
+    CARTON_NOT_FOUND_PREFIX = "Could not find a Carton with the code"
+
     def check_carton (self, carton_code):
-        url = f'{self.BASE_URL}/api/StorageMedia/ValidateCarton?cartonCode={carton_code}'
+        # Mintsoft no expone un "existe / no existe" limpio: ValidateCarton devuelve
+        # un objeto Result y el unico caso que comunica explicitamente es el de "no
+        # existe", por el texto de Message. En el caso de exito Message viene null,
+        # asi que la ausencia de mensaje se interpreta como "la caja existe".
+        if carton_code is None or not str(carton_code).strip():
+            raise ValueError(
+                "check_carton: el line item no trae put_away_bin, "
+                "no se puede validar ni crear la caja"
+            )
 
-        response = requests.get(url, headers=self.headers())
+        carton_code = str(carton_code).strip()
 
-        json = response.json()
+        url = f'{self.BASE_URL}/api/StorageMedia/ValidateCarton'
 
-        message = json.get("Message")
+        # params= en vez de interpolar: los codigos de caja escaneados pueden traer
+        # caracteres que rompen el querystring (#, &, %, espacios).
+        response = requests.get(
+            url,
+            headers=self.headers(),
+            params={"cartonCode": carton_code},
+            timeout=120,
+        )
 
-        if message.startswith("Could not find a Carton with the code"):
-            
+        try:
+            data = response.json()
+        except ValueError:
+            print(f"check_carton: respuesta no-JSON para '{carton_code}' -> "
+                  f"HTTP {response.status_code} {response.text[:500]}")
+            response.raise_for_status()
+            raise RuntimeError(
+                f"ValidateCarton devolvio una respuesta no-JSON para el carton '{carton_code}'"
+            )
+
+        if not isinstance(data, dict):
+            print(f"check_carton: payload inesperado para '{carton_code}' -> "
+                  f"HTTP {response.status_code} {json.dumps(data)[:500]}")
+            response.raise_for_status()
+            raise RuntimeError(
+                f"ValidateCarton devolvio un payload inesperado para el carton '{carton_code}'"
+            )
+
+        message = data.get("Message")
+        was_successful = data.get("WasSuccessful")
+
+        # 1. La caja no existe: hay que crearla.
+        if isinstance(message, str) and message.startswith(self.CARTON_NOT_FOUND_PREFIX):
             return False
-        
-        else:
 
-            return True
+        # 2. Error real de la API (token vencido, 5xx, parametro invalido). No se
+        #    puede decidir nada, se corta con un error claro en vez de adivinar y
+        #    terminar moviendo stock a la caja equivocada.
+        if not response.ok or was_successful is False:
+            print(f"check_carton: ValidateCarton fallo para '{carton_code}' -> "
+                  f"HTTP {response.status_code} {json.dumps(data)[:500]}")
+            response.raise_for_status()
+            raise RuntimeError(
+                f"ValidateCarton no pudo validar el carton '{carton_code}': {message!r}"
+            )
+
+        # 3. 2xx sin mensaje de "no existe": la caja existe. Este es el caso que
+        #    antes rompia con AttributeError, porque Message viene null.
+        if message is not None:
+            print(f"check_carton: mensaje inesperado para '{carton_code}': {message!r} "
+                  f"- se asume que la caja existe")
+
+        return True
 
     def create_carton(self, carton_data, client_id):
         url = f'{self.BASE_URL}/api/StorageMedia/CreateCarton?autoGenerateSSCC=false&clientId={client_id}'

@@ -534,6 +534,16 @@ class MintsoftReturnService:
                 warehouse = map_warehouse(merchant) # 3 si es Wholesale, 5 si es E-Comm
                 carton_code = item.get("put_away_bin")
 
+                # Los payloads de RMA pueden traer put_away_bin en null. Sin codigo de
+                # caja no hay destino para el transfer: se saltea el item (queda el stock
+                # en RET / RET-TEMP) en vez de crear una caja basura con Code: None.
+                if not carton_code or not str(carton_code).strip():
+                    self.logger.warning(
+                        f"Item {sku} sin put_away_bin - no se reasigna, "
+                        f"el stock queda en la ubicacion de staging"
+                    )
+                    continue
+
                 disposition = item.get("disposition")
                 if disposition == "Return to Stock": # Stock en buenas condiciones
 

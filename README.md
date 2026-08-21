@@ -278,11 +278,43 @@ transferencia misma lleva `"Type": "Quarantine"`.
 `reallocate_return_items` mueve el stock desde la ubicación de staging a la caja física que
 escaneó el operario (`put_away_bin`):
 
-1. `GET /api/StorageMedia/ValidateCarton?cartonCode=…` — la existencia se infiere de si el
-   `Message` de la respuesta empieza con `"Could not find a Carton with the code"`.
-2. Si no existe → `POST /api/StorageMedia/CreateCarton` (`StorageMediaName: "Stock"`, ubicada en
+1. Si el item no trae `put_away_bin`, se **saltea** con un warning: sin código de caja no hay
+   destino para el transfer, y el stock queda en la ubicación de staging. Los payloads de RMA
+   pueden traer `put_away_bin: null` (ver `models/tb_rma_model.json`).
+2. `GET /api/StorageMedia/ValidateCarton?cartonCode=…` — ver [`check_carton`](#check_carton-y-la-detección-de-cajas-existentes) abajo.
+3. Si no existe → `POST /api/StorageMedia/CreateCarton` (`StorageMediaName: "Stock"`, ubicada en
    la ubicación `RET` / `RET-TEMP` correspondiente, `autoGenerateSSCC=false`).
-3. `PUT /api/Warehouse/TransferStock` desde `RET`/`RET-TEMP` → código de la caja.
+4. `PUT /api/Warehouse/TransferStock` desde `RET`/`RET-TEMP` → código de la caja.
+
+#### `check_carton` y la detección de cajas existentes
+
+`ValidateCarton` no devuelve un "existe / no existe" limpio: devuelve un objeto `Result` y el
+único caso que comunica de forma explícita es el de **no existe**, por el texto del campo
+`Message` (`"Could not find a Carton with the code …"`). En el caso de éxito `Message` viene
+`null`. `check_carton` (`clients/mintsoftClient.py:302`) resuelve en este orden:
+
+| Respuesta | Resultado |
+|---|---|
+| `Message` empieza con `"Could not find a Carton with the code"` | `False` — hay que crear la caja |
+| No-2xx, o `WasSuccessful: false` con otro mensaje | **Excepción** con el status y el body crudo logueados |
+| 2xx sin mensaje de "no existe" (`Message: null`) | `True` — la caja existe |
+| 2xx con un mensaje inesperado | `True`, y se loguea el mensaje |
+| Body no-JSON o payload que no es un objeto | **Excepción** con el body crudo logueado |
+| `put_away_bin` vacío o `None` | `ValueError` (el service saltea el item antes de llegar acá) |
+
+La versión anterior hacía `json.get("Message").startswith(...)` directo, así que **cualquier
+respuesta con `Message: null` — es decir el caso normal de caja ya existente — rompía con
+`AttributeError: 'NoneType' object has no attribute 'startswith'`** y abortaba el return
+completo, dejando el stock en `RET` / `RET-TEMP`.
+
+Para los casos ambiguos se elige deliberadamente **cortar con una excepción** en vez de adivinar:
+un `False` incorrecto haría que `CreateCarton` corra sobre un código ya existente y podría
+reubicar una caja que está en otro lado; un `True` incorrecto hace fallar el `TransferStock`
+después, que es un error recuperable. El status y el body crudo se imprimen siempre en esos
+casos, así que la próxima ocurrencia dice exactamente qué devolvió Mintsoft.
+
+El `cartonCode` se manda por `params=` y no interpolado en la URL: los códigos escaneados pueden
+traer `#`, `&`, `%` o espacios, que romperían el querystring.
 
 ### Fallback Barcode → SKU y la limitación de `SearchBarcode`
 
@@ -477,8 +509,10 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
 8. **`get_product_id` arma una URL con doble slash** (`…co.uk//api/Product/Search`), que
    Mintsoft acepta igual.
 9. **`reallocate_return_items` devuelve el último `response`**, por lo que lanza
-   `UnboundLocalError` si `line_items` está vacío; además re-lanza la excepción, mientras que
-   `add_return_items` la absorbe.
+   `UnboundLocalError` si `line_items` está vacío (o si todos los items se saltean por no traer
+   `put_away_bin`); además re-lanza la excepción, mientras que `add_return_items` la absorbe.
+   Como re-lanza, cualquier fallo en un item **aborta la reasignación de los items siguientes** y
+   ese stock queda en `RET` / `RET-TEMP`.
 10. **`allocate_external_return_items` sobreescribe el parámetro `data`** dentro de su loop; el
     manejador de errores se protege de eso con un chequeo de `isinstance` / `"event_data" in data`.
 11. **El manejador de errores de `add_return_items` referencia `new_identifier`**, que queda sin
