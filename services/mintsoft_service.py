@@ -270,6 +270,9 @@ class MintsoftReturnService:
                     "WarehouseId": warehouse,
                     "ReturnItems": [],
                 }
+                # Trackings ya escritos en Comments, para no repetirlos en cada item
+                commented_tracking_numbers = set()
+
                 for item in line_items:
                     sku = item.get("sku")
                     barcode = _get_item_barcode(item)
@@ -313,10 +316,12 @@ class MintsoftReturnService:
                         "ReturnReasonId": return_reason,
                     }
 
-                    # Tracking del item, y si no tiene usamos el del return
+                    # Tracking del item, y si no tiene usamos el del return.
+                    # Solo se escribe una vez en Comments, sin importar la cantidad de items.
                     tracking_number = (item.get("tracking_number") or "").strip() or return_tracking_number
-                    if tracking_number:
+                    if tracking_number and tracking_number not in commented_tracking_numbers:
                         return_item_data["Comments"] = tracking_number
+                        commented_tracking_numbers.add(tracking_number)
 
                     external_return_data["ReturnItems"].append(return_item_data)
 
