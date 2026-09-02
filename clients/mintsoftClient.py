@@ -261,7 +261,14 @@ class MintsoftOrderClient:
         return response
 
     def quarantine_stock(self, request):
-        """Manda stock a cuarentena (StockMovement Action=7). Lanza si falla."""
+        """Manda stock a cuarentena (StockMovement Action=7). Lanza si falla.
+
+        NO usar en el flujo de returns: Mintsoft ya cuarentena al confirmar, por el
+        StockAction del motivo (ReturnReasonId=2), y conservando la location.
+        Llamarla después falla con "Unable to Quarantine stock as not enough could
+        be found in the selected location!", porque en esa location ya no hay stock
+        sin cuarentenar. Queda para cuarentenar stock a mano, fuera de un return.
+        """
         url = f"{self.BASE_URL}/api/Warehouse/StockMovement?Action=7"
 
         r = requests.post(

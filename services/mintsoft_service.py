@@ -747,10 +747,30 @@ class MintsoftReturnService:
 
                 else: # Stock a mandar a cuarentena
 
+                    # La cuarentena NO se pide acá: Mintsoft ya la aplicó al confirmar
+                    # el return, porque el motivo que usamos para stock en mal estado
+                    # (ReturnReasonId=2, "Faulty or Damaged - Quarantine Stock") tiene
+                    # StockAction='Quarantine'. Y la aplica CONSERVANDO la location, así
+                    # que la unidad queda en RET-TEMP con Type='Quarantine'.
+                    #
+                    # Antes se llamaba además a StockMovement?Action=7, que fallaba
+                    # SIEMPRE con "Unable to Quarantine stock as not enough could be
+                    # found in the selected location!": en esa location ya no queda
+                    # stock normal para cuarentenar, porque la unidad ya está
+                    # cuarentenada. Por eso el comment 'Returned stock sent to
+                    # Quarantine' no aparece en ningún movimiento histórico.
+                    #
+                    # El TransferStock de abajo sí mueve stock ya cuarentenado (lleva
+                    # Type='Quarantine') y deja la unidad en la caja conservando el
+                    # estado: verificado contra la API, "Successfully transferred 1 of
+                    # 74 from RET-TEMP to TEST-QT-01" -> Type='Quarantine' Carton set.
+
                     if warehouse == 3:
-                        temporary_location_id = 9 # RET-QT Wholesale
+                        temporary_location_id = 9    # RET-TEMP Wholesale
+                        returns_location_id = 4104   # RET Wholesale
                     else:
                         temporary_location_id = 4304 # RET-TEMP E-Comm
+                        returns_location_id = 4299   # RET E-Comm
 
                     reallocation_data = {
                         "SourceWarehouseId": warehouse,
@@ -763,29 +783,38 @@ class MintsoftReturnService:
                         "Comment": "Return reallocation",
                     }
 
-                    quarantine_data = {
-                        "ProductID": product_id,
-                        "WarehouseId": warehouse,
-                        "LocationId": temporary_location_id,
-                        "Quantity": item.get("quantity"),
-                        "Comment": "Returned stock sent to Quarantine"
-                    }
-
                     if self.client.check_carton(carton_code) == False: # Check si existe la caja
                         print(f'Carton {carton_code} not in Mintsoft - creating Carton...')
                         client_id = map_client(merchant)
 
+                        # La caja se crea en RET, NO en RET-TEMP, por dos razones:
+                        #
+                        #  1. Es donde tiene que quedar la mercadería: RET-TEMP es la
+                        #     location transitoria de aislamiento, no un destino.
+                        #  2. Si la caja vive en RET-TEMP -- la misma location a la que
+                        #     el confirm alloca el item -- y ya contiene ese SKU, Mintsoft
+                        #     consolida la unidad nueva adentro de la caja y no queda nada
+                        #     suelto. Después el TransferStock falla con "Could not find
+                        #     any of product ID: X in RET-TEMP!". Con la caja en RET eso
+                        #     no pasa: el confirm deja la unidad suelta en RET-TEMP y el
+                        #     transfer siempre la encuentra.
+                        #
+                        # El transfer sigue saliendo de RET-TEMP: el destino es el código
+                        # de caja, y Mintsoft arrastra la unidad a la location de la caja
+                        # conservando Type='Quarantine'.
                         carton_data = {
                             "WarehouseId": warehouse,
                             "StorageMediaName": "Stock",
                             "Code": carton_code,
-                            "LocationId": temporary_location_id
+                            "LocationId": returns_location_id
                         }
 
                         self.client.create_carton(carton_data, client_id)
 
-                    self.client.quarantine_stock(quarantine_data)
-                    self.logger.info(f"{sku} from Return set to Quarantine at Location: {item.get("put_away_bin")}")
+                    self.logger.info(
+                        f"{sku}: cuarentena ya aplicada por Mintsoft al confirmar el return "
+                        f"(ReturnReasonId=2). Reubicando a la caja {carton_code}."
+                    )
 
                     response = self.client.transfer_stock(reallocation_data)
                     responses.append(response)
