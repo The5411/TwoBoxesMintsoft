@@ -380,6 +380,11 @@ class MintsoftOrderClient:
 
         print(f"Product ID for SKU {sku} (ClientId {client_id}): {product_id}")
 
+        # barcode puede venir None (los payloads de RMA no traen line_items[].barcode),
+        # asi que se normaliza antes de medirlo: antes esto reventaba con
+        # "TypeError: object of type 'NoneType' has no len()" y el item se perdia.
+        barcode = str(barcode).strip() if barcode is not None else ""
+
         if product_id == None and len(barcode) > 7:
             sku_rety = self.get_sku_dado_barcode(barcode)
             # Sku ret
@@ -411,32 +416,26 @@ class MintsoftOrderClient:
     
 
     
-    # ValidateCarton NO sirve como chequeo de existencia en esta cuenta: devuelve
-    # Success=false para TODAS las cajas (probado con RV-RETURNS-* y *RV-2505-*),
-    # con el mensaje "The retrieved Carton does not have a valid prefix and code!".
-    # Ese mensaje significa que la caja EXISTE (Mintsoft la "retrieved") pero no
-    # tiene un SSCC valido -- probablemente porque create_carton las crea con
-    # autoGenerateSSCC=false. Y no impide nada: TransferStock funciona igual
-    # contra esas cajas. Por eso lo unico que miramos es si Mintsoft dice
-    # explicitamente que no la encontro; NO mirar Success, que daria False
-    # siempre y haria recrear cajas existentes en cada return.
-    _CARTON_NOT_FOUND_PREFIX = "Could not find a Carton with the code"
+    CARTON_NOT_FOUND_PREFIX = "Could not find a Carton with the code"
 
-    def check_carton(self, carton_code) -> bool:
-        """True si la caja existe en Mintsoft, False si Mintsoft dice que no está.
+    def check_carton (self, carton_code):
+        # Mintsoft no expone un "existe / no existe" limpio: ValidateCarton devuelve
+        # un objeto Result y el unico caso que comunica explicitamente es el de "no
+        # existe", por el texto de Message. En el caso de exito Message viene null,
+        # asi que la ausencia de mensaje se interpreta como "la caja existe".
+        if carton_code is None or not str(carton_code).strip():
+            raise ValueError(
+                "check_carton: el line item no trae put_away_bin, "
+                "no se puede validar ni crear la caja"
+            )
 
-        Lanza ValueError si no viene codigo: antes, con carton_code vacio,
-        Mintsoft contestaba "Carton code was not provided." y esta funcion
-        devolvia True (porque el mensaje no arranca con el prefijo de
-        not-found), asi que el caller se salteaba crear la caja y despues
-        transferia stock a un destino vacio.
-        """
-        if not str(carton_code or "").strip():
-            raise ValueError("check_carton: carton_code vacio (put_away_bin sin valor)")
+        carton_code = str(carton_code).strip()
 
         url = f'{self.BASE_URL}/api/StorageMedia/ValidateCarton'
 
-        r = requests.get(
+        # params= en vez de interpolar: los codigos de caja escaneados pueden traer
+        # caracteres que rompen el querystring (#, &, %, espacios).
+        response = requests.get(
             url,
             headers=self.headers(),
             params={"cartonCode": carton_code},

@@ -48,6 +48,20 @@ def _order_number_variants(value) -> List[str]:
     return variants
 
 
+def _get_item_barcode(item) -> Optional[str]:
+    """Barcode de un line item de Two Boxes.
+
+    Los payloads de RMA traen line_items[].barcode en null y el barcode real vive en
+    line_items[].product_variant.barcode (ver models/tb_rma_model.json), asi que hay
+    que mirar los dos lugares. Devuelve None si no hay ninguno.
+    """
+    item = item or {}
+    for candidate in (item.get("barcode"), (item.get("product_variant") or {}).get("barcode")):
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return None
+
+
 class MintsoftReturnService:
     def __init__(self, logger_name: str = "mintsoft_service", log_file: str = "m_service.log"):
         self.logger = get_logger(logger_name, log_file)
@@ -306,9 +320,13 @@ class MintsoftReturnService:
                     "WarehouseId": warehouse,
                     "ReturnItems": [],
                 }
+                # Trackings ya escritos en Comments, para no repetirlos en cada item
+                commented_tracking_numbers = set()
+
                 for item in line_items:
                     sku = item.get("sku")
-                    sku, product_id = self.client.get_product_id(sku, client_id, item.get("barcode"))
+                    barcode = _get_item_barcode(item)
+                    sku, product_id = self.client.get_product_id(sku, client_id, barcode)
 
                     if product_id == None:
                         # Si el item no existe en Mintsoft con ese SKU
@@ -316,7 +334,7 @@ class MintsoftReturnService:
                         new_product_data = {
                             "SKU": sku,
                             "Name": (item.get("product_variant") or {}).get("name") or item.get("sku"),
-                            "EAN": item.get("barcode"),
+                            "EAN": barcode,
                             "ClientId": client_id,
                         }
 
@@ -340,13 +358,22 @@ class MintsoftReturnService:
                     else:
                         return_reason = 2
 
-                    external_return_data["ReturnItems"].append({
+                    return_item_data = {
                         "SKU": sku,
                         "ProductId": product_id,
                         "Quantity": item.get("quantity"),
                         "Action": "NONE",
                         "ReturnReasonId": return_reason,
-                    })
+                    }
+
+                    # Tracking del item, y si no tiene usamos el del return.
+                    # Solo se escribe una vez en Comments, sin importar la cantidad de items.
+                    tracking_number = (item.get("tracking_number") or "").strip() or return_tracking_number
+                    if tracking_number and tracking_number not in commented_tracking_numbers:
+                        return_item_data["Comments"] = tracking_number
+                        commented_tracking_numbers.add(tracking_number)
+
+                    external_return_data["ReturnItems"].append(return_item_data)
 
                 print(external_return_data)
                 external_return_id = self.client.create_external_return(data=external_return_data)
@@ -426,6 +453,10 @@ class MintsoftReturnService:
                 response = self.client.allocate_return_item_location(return_id, data)
                 self.logger.info(f"Allocated External Return Items to {location_id}: {response}")
 
+
+            response = self.client.confirm_return(return_id)
+            self.logger.info(f"Confirmed return {return_id}: {response}")
+
             return None
 
         except Exception as e:
@@ -465,6 +496,10 @@ class MintsoftReturnService:
             # Guardaremos el (ReturnItemId, item, location_id) para allocarlos luego
             items_to_allocate = []
 
+            # Items que se caen del return sin abortarlo. Se reportan al final: un return
+            # con menos unidades de las que devolvio el cliente tiene que ser visible.
+            dropped_items = []
+
             # Step 1: Add items to the return
             for item in line_items:
                 disposition = item.get("disposition")
@@ -477,13 +512,15 @@ class MintsoftReturnService:
                 sku = (item.get("sku") or "").strip()
                 if not sku:
                     self.logger.warning("Skipping line item with missing or empty SKU")
+                    dropped_items.append({"sku": None, "motivo": "line item sin SKU"})
                     continue
 
                 product_id = None
                 try:
-                    sku, product_id = self.client.get_product_id(sku, client_id, item.get("barcode"))
+                    sku, product_id = self.client.get_product_id(sku, client_id, _get_item_barcode(item))
                 except Exception as e:
-                    self.logger.error(f"Error al obtener product_id para SKU {sku}: {e}")
+                    self.logger.error(f"Error al obtener product_id para SKU {sku}: {e}", exc_info=True)
+                    dropped_items.append({"sku": sku, "motivo": f"{type(e).__name__}: {e}"})
                     continue
 
                 if disposition == "Return to Stock":
@@ -558,6 +595,31 @@ class MintsoftReturnService:
             response = self.client.confirm_return(return_id)
             self.logger.info(f"Confirmed return {return_id}: {response}")
 
+            # El return quedo confirmado igual, pero si se cayeron items quedo corto
+            # (o vacio, si se cayeron todos). Hay que avisar para corregirlo a mano.
+            if dropped_items:
+                detalle = ", ".join(
+                    f"{d['sku']} ({d['motivo']})" for d in dropped_items
+                )
+                self.logger.error(
+                    f"Return {return_id} confirmado con {len(items_to_allocate)} de "
+                    f"{len(line_items)} items. Items caidos: {detalle}"
+                )
+                self._send_error_email(
+                    method="add_return_items",
+                    error=RuntimeError(
+                        f"Return {return_id} confirmado incompleto: "
+                        f"{len(items_to_allocate)} de {len(line_items)} items"
+                    ),
+                    order_reference=self._get_return_identifier(data),
+                    context={
+                        "return_id": return_id,
+                        "items_agregados": len(items_to_allocate),
+                        "items_en_el_payload": len(line_items),
+                        "items_caidos": dropped_items,
+                    },
+                )
+
             return None
 
         except Exception as e:
@@ -599,7 +661,7 @@ class MintsoftReturnService:
         try:
             for item in line_items:
                 sku = item.get("sku")
-                sku, product_id = self.client.get_product_id(sku, client_id, item.get("barcode"))
+                sku, product_id = self.client.get_product_id(sku, client_id, _get_item_barcode(item))
                 merchant = self._get_merchant_name(data)
                 warehouse = map_warehouse(merchant) # 3 si es Wholesale, 5 si es E-Comm
                 carton_code = (item.get("put_away_bin") or "").strip()
@@ -612,6 +674,16 @@ class MintsoftReturnService:
                         f"reubicacion de stock."
                     )
                     sin_caja.append(str(sku))
+                    continue
+
+                # Los payloads de RMA pueden traer put_away_bin en null. Sin codigo de
+                # caja no hay destino para el transfer: se saltea el item (queda el stock
+                # en RET / RET-TEMP) en vez de crear una caja basura con Code: None.
+                if not carton_code or not str(carton_code).strip():
+                    self.logger.warning(
+                        f"Item {sku} sin put_away_bin - no se reasigna, "
+                        f"el stock queda en la ubicacion de staging"
+                    )
                     continue
 
                 disposition = item.get("disposition")
@@ -646,6 +718,7 @@ class MintsoftReturnService:
                         self.client.create_carton(carton_data, client_id)
 
                     response = self.client.transfer_stock(reallocation_data)
+                    responses.append(response)
                     print(response)
 
                 else: # Stock a mandar a cuarentena
@@ -691,6 +764,7 @@ class MintsoftReturnService:
                     self.logger.info(f"{sku} from Return set to Quarantine at Location: {item.get("put_away_bin")}")
 
                     response = self.client.transfer_stock(reallocation_data)
+                    responses.append(response)
                     print(response)
 
             if sin_caja:
@@ -699,27 +773,25 @@ class MintsoftReturnService:
                     f"{', '.join(sin_caja)}"
                 )
 
-            return response
+            if line_items and not responses:
+                self.logger.warning(
+                    f"No se reasigno ningun item de los {len(line_items)} del payload "
+                    f"(ninguno traia put_away_bin): el stock quedo en RET / RET-TEMP"
+                )
+
+            return responses
 
         except Exception as e:
             self.logger.error(f"Error reallocating return items: {e}", exc_info=True)
-            event_data = data["event_data"]
-            line_items = event_data.get("line_items", [])
-            return_identifier = line_items[0].get("tracking_number") # Si hay, es el tracking number
-
-            if return_identifier is None:
-                completed_at = event_data.get("completed_at")
-                customer_email = event_data["customer"].get("email")
-                new_identifier = f"{completed_at}-{customer_email}"
-                return_identifier = new_identifier
-
             self._send_error_email(
                 method="reallocate_return_items",
                 error=e,
-                order_reference=return_identifier,
+                order_reference=self._get_return_identifier(data),
                 context={
                     "merchant_name": merchant_name,
                     "client_id": client_id,
+                    "items_reasignados": len(responses),
+                    "items_en_el_payload": len(line_items),
                 },
             )
             raise
