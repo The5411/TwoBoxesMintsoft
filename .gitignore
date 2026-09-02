@@ -52,3 +52,10 @@ Thumbs.db
 
 # ---- Notebooks ----
 .ipynb_checkpoints/
+
+# ---- Payloads reales de webhooks (traen PII de clientes) ----
+jsonretry.json
+*.payload.json
+
+# ---- Herramientas de debug locales, no van al repo ----
+retry_webhook.py
