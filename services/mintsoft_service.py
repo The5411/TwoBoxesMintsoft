@@ -340,6 +340,19 @@ class MintsoftReturnService:
                     "WarehouseId": warehouse,
                     "ReturnItems": [],
                 }
+                # Tracking a nivel return: el primero que traiga alguno de los items.
+                # Se usaba como fallback (`or return_tracking_number`) sin estar
+                # definido, así que la rama externa tiraba NameError.
+                # Ojo: no se reusa return_identifier porque ese cae al número de
+                # orden cuando no hay tracking, y acá queremos un tracking o nada.
+                return_tracking_number = next(
+                    (
+                        str((li or {}).get("tracking_number") or "").strip()
+                        for li in line_items
+                        if str((li or {}).get("tracking_number") or "").strip()
+                    ),
+                    "",
+                )
                 # Trackings ya escritos en Comments, para no repetirlos en cada item
                 commented_tracking_numbers = set()
 
@@ -632,7 +645,7 @@ class MintsoftReturnService:
                         f"Return {return_id} confirmado incompleto: "
                         f"{len(items_to_allocate)} de {len(line_items)} items"
                     ),
-                    order_reference=self._get_return_identifier(data),
+                    order_reference=self._return_identifier(data),
                     context={
                         "return_id": return_id,
                         "items_agregados": len(items_to_allocate),
@@ -656,13 +669,14 @@ class MintsoftReturnService:
     def reallocate_return_items(self, data):
         merchant_name = self._get_merchant_name(data)
         client_id = map_client(merchant_name) # Si no encuentra devuelve None
-        event_data = data.get("event_data")
+        event_data = data.get("event_data") or {}
         line_items = event_data.get("line_items", [])
 
-        # response se inicializa porque solo se asigna dentro del loop: si no hay
-        # line_items (o se saltean todos) el `return response` del final tiraba
-        # UnboundLocalError.
-        response = None
+        # Se acumula un resultado por item reasignado. Hay que inicializarla acá:
+        # responses.append() y `return responses` se usaban sin que la lista
+        # existiera, así que reallocate_return_items() tiraba NameError en cuanto
+        # llegaba al primer transfer_stock().
+        responses: List[Any] = []
         # Items sin put_away_bin: no se pueden mover a ninguna caja. Se saltean
         # para no bloquear a los demas, y al final se lanza para que salga el mail.
         sin_caja: List[str] = []

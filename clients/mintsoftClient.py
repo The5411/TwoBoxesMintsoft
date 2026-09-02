@@ -442,10 +442,10 @@ class MintsoftOrderClient:
             timeout=120,
         )
 
-        body = self._toolkit_result(r, f"StorageMedia/ValidateCarton({carton_code})")
+        body = self._toolkit_result(response, f"StorageMedia/ValidateCarton({carton_code})")
         message = body.get("Message") or ""
 
-        return not message.startswith(self._CARTON_NOT_FOUND_PREFIX)
+        return not message.startswith(self.CARTON_NOT_FOUND_PREFIX)
 
     def create_carton(self, carton_data, client_id):
         """Crea una caja. Lanza si la request falla; si Mintsoft la rechaza, loguea.
