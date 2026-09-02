@@ -71,8 +71,9 @@ clients = [
 IGNORED_CLIENTS = ["posse"]
 
 
-def _send_unmapped_client_email(tb_name: str) -> None:
-    """Avisa por mail que tb_name no está en la lista de clientes. Nunca lanza."""
+def _send_alert_email(subject: str, body: str) -> None:
+    """Manda un mail de alerta. Nunca lanza: un fallo de notificación no debe
+    romper al caller."""
     try:
         smtp_host = os.environ.get("SMTP_HOST")
         smtp_port = int(os.environ.get("SMTP_PORT", "587"))
@@ -80,21 +81,17 @@ def _send_unmapped_client_email(tb_name: str) -> None:
         smtp_password = os.environ.get("SMTP_PASSWORD")
         email_to = os.environ.get(
             "ALERT_EMAIL_TO",
-            "mbivort@the5411.com, jcordero@the5411.com, ngurfinkel@the5411.com, mbivort@the5411.com",
+            "mbivort@the5411.com, jcordero@the5411.com, ngurfinkel@the5411.com",
         )
 
         if not (smtp_host and smtp_user and smtp_password):
             return
 
         msg = EmailMessage()
-        msg["Subject"] = f"[MintsoftReturnService] Cliente no mapeado: {tb_name}"
+        msg["Subject"] = subject
         msg["From"] = os.environ.get("ALERT_EMAIL_FROM", smtp_user)
         msg["To"] = email_to
-        msg.set_content(
-            f"El cliente '{tb_name}' no está en la lista de clientes de "
-            f"mappers/mintsoft_mapper.py, por lo que map_client() y map_warehouse() "
-            f"devolvieron None y la devolución no se pudo mapear."
-        )
+        msg.set_content(body)
 
         with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
             server.ehlo()
@@ -106,15 +103,52 @@ def _send_unmapped_client_email(tb_name: str) -> None:
             server.login(smtp_user, smtp_password)
             server.send_message(msg)
     except Exception:
-        # Que un fallo de notificación no rompa al caller.
         pass
+
+
+def _send_unmapped_client_email(tb_name: str) -> None:
+    """Avisa que tb_name no está en la lista de clientes."""
+    _send_alert_email(
+        subject=f"[MintsoftReturnService] Cliente no mapeado: {tb_name}",
+        body=(
+            f"El cliente '{tb_name}' no está en la lista de clientes de "
+            f"mappers/mintsoft_mapper.py, por lo que map_client() y map_warehouse() "
+            f"devolvieron None y la devolución no se pudo mapear."
+        ),
+    )
+
+
+def _send_missing_merchant_email() -> None:
+    """Avisa que el payload llegó sin merchant. Nunca lanza."""
+    _send_alert_email(
+        subject="[MintsoftReturnService] Payload sin merchant",
+        body=(
+            "Llegó un webhook del que no se pudo extraer el nombre del merchant: "
+            "no vino en event_data['merchant'], ni en event_data['line_items'][0]"
+            "['merchant'], ni en event_data['merchant_integration'].\n\n"
+            "map_client() y map_warehouse() devolvieron None y la devolución no se "
+            "pudo procesar. Esto NO es un cliente faltante en "
+            "mappers/mintsoft_mapper.py: es un problema de forma del payload "
+            "(por ejemplo un event_type sin line_items)."
+        ),
+    )
 
 
 #
 def map_client(tb_name:str):
+    tb_name = str(tb_name or "").strip()
+
     for client in clients:
         if client["tb_name"].lower() == tb_name.lower():
             return client["m_id"]
+
+    if not tb_name:
+        # Nombre vacío no es un cliente sin mapear: es que no se pudo sacar el
+        # merchant del payload. Avisar "el cliente '' no está en la lista" mandaba
+        # a revisar el mapper cuando el problema estaba en la extracción.
+        _send_missing_merchant_email()
+        return None
+
     if tb_name.lower() not in IGNORED_CLIENTS:
         _send_unmapped_client_email(tb_name)
     return None

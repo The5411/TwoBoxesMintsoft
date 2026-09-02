@@ -150,18 +150,38 @@ class MintsoftReturnService:
             self.logger.error(f"Failed to send error alert email: {mail_err}", exc_info=True)
 
     def _get_merchant_name(self, data) -> str:
-        """Get merchant name from event_data; supports both merchant_integration and line_items[0].merchant."""
-        event_data = data["event_data"]
+        """Nombre del merchant, buscándolo en los tres lugares donde puede venir.
+
+        Two Boxes lo manda tanto en event_data['merchant'] como en
+        event_data['line_items'][0]['merchant']. Antes solo se miraba el del
+        line item (y un event_data['merchant_integration'] que no existe en
+        estos payloads), así que cualquier evento sin line_items -- o con un
+        line item sin merchant -- devolvía "" y disparaba el mail de "cliente
+        no mapeado" con el nombre vacío, aunque el merchant estuviera en el
+        payload al lado.
+        """
+        event_data = (data or {}).get("event_data") or {}
+
         try:
-            return event_data["merchant_integration"]["merchant"]["name"]
+            name = event_data["merchant_integration"]["merchant"]["name"]
+            if name and name.strip():
+                return name.strip()
         except (KeyError, TypeError):
             pass
+
         line_items = event_data.get("line_items") or []
         if line_items:
             merchant = (line_items[0] or {}).get("merchant") or {}
             name = merchant.get("name")
-            if name:
+            if name and name.strip():
                 return name.strip()
+
+        # El merchant del return, presente incluso cuando no hay line_items.
+        merchant = event_data.get("merchant") or {}
+        name = merchant.get("name")
+        if name and name.strip():
+            return name.strip()
+
         return ""
 
     def _get_storefront_order_number(self, data) -> str:
@@ -320,6 +340,19 @@ class MintsoftReturnService:
                     "WarehouseId": warehouse,
                     "ReturnItems": [],
                 }
+                # Tracking a nivel return: el primero que traiga alguno de los items.
+                # Se usaba como fallback (`or return_tracking_number`) sin estar
+                # definido, así que la rama externa tiraba NameError.
+                # Ojo: no se reusa return_identifier porque ese cae al número de
+                # orden cuando no hay tracking, y acá queremos un tracking o nada.
+                return_tracking_number = next(
+                    (
+                        str((li or {}).get("tracking_number") or "").strip()
+                        for li in line_items
+                        if str((li or {}).get("tracking_number") or "").strip()
+                    ),
+                    "",
+                )
                 # Trackings ya escritos en Comments, para no repetirlos en cada item
                 commented_tracking_numbers = set()
 
@@ -502,6 +535,7 @@ class MintsoftReturnService:
 
             # Step 1: Add items to the return
             for item in line_items:
+                item = item or {}  # un line_item null rompia el loop entero
                 disposition = item.get("disposition")
 
                 if disposition == "Missing":
@@ -611,7 +645,7 @@ class MintsoftReturnService:
                         f"Return {return_id} confirmado incompleto: "
                         f"{len(items_to_allocate)} de {len(line_items)} items"
                     ),
-                    order_reference=self._get_return_identifier(data),
+                    order_reference=self._return_identifier(data),
                     context={
                         "return_id": return_id,
                         "items_agregados": len(items_to_allocate),
@@ -624,22 +658,10 @@ class MintsoftReturnService:
 
         except Exception as e:
             self.logger.error(f"Error adding items to return {return_id}: {e}", exc_info=True)
-            event_data = data.get("event_data", {})
-            line_items = event_data.get("line_items", [])
-            
-            return_identifier = None
-            if line_items:
-                return_identifier = line_items[0].get("tracking_number")
-
-            if not return_identifier:
-                completed_at = event_data.get("completed_at", "")
-                customer_email = (event_data.get("customer") or {}).get("email", "")
-                return_identifier = f"{completed_at}-{customer_email}"
-
             self._send_error_email(
                 method="add_return_items",
                 error=e,
-                order_reference=return_identifier, # <--- Corregido
+                order_reference=self._return_identifier(data),
                 context={"return_id": return_id},
             )
             return None
@@ -647,19 +669,21 @@ class MintsoftReturnService:
     def reallocate_return_items(self, data):
         merchant_name = self._get_merchant_name(data)
         client_id = map_client(merchant_name) # Si no encuentra devuelve None
-        event_data = data.get("event_data")
+        event_data = data.get("event_data") or {}
         line_items = event_data.get("line_items", [])
 
-        # response se inicializa porque solo se asigna dentro del loop: si no hay
-        # line_items (o se saltean todos) el `return response` del final tiraba
-        # UnboundLocalError.
-        response = None
+        # Se acumula un resultado por item reasignado. Hay que inicializarla acá:
+        # responses.append() y `return responses` se usaban sin que la lista
+        # existiera, así que reallocate_return_items() tiraba NameError en cuanto
+        # llegaba al primer transfer_stock().
+        responses: List[Any] = []
         # Items sin put_away_bin: no se pueden mover a ninguna caja. Se saltean
         # para no bloquear a los demas, y al final se lanza para que salga el mail.
         sin_caja: List[str] = []
 
         try:
             for item in line_items:
+                item = item or {}  # un line_item null rompia el loop entero
                 sku = item.get("sku")
                 sku, product_id = self.client.get_product_id(sku, client_id, _get_item_barcode(item))
                 merchant = self._get_merchant_name(data)
@@ -783,10 +807,13 @@ class MintsoftReturnService:
 
         except Exception as e:
             self.logger.error(f"Error reallocating return items: {e}", exc_info=True)
+            # Nada de recalcular el identificador a mano acá: line_items[0] con lista
+            # vacía o un customer ausente lanzaban DENTRO del handler y el error real
+            # quedaba tapado por el del propio handler.
             self._send_error_email(
                 method="reallocate_return_items",
                 error=e,
-                order_reference=self._get_return_identifier(data),
+                order_reference=self._return_identifier(data),
                 context={
                     "merchant_name": merchant_name,
                     "client_id": client_id,
