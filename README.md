@@ -235,19 +235,37 @@ de Two Boxes** (`tb_name`) a un **client id de Mintsoft** (`m_id`) y un **wareho
 ### Return interno vs externo
 
 ```
-storefront_order_number se compara contra las órdenes de Mintsoft
-con StatusId ∈ {4, 5, 6}  (fetch_mintsoft_orders → match_rma_order)
+storefront_order_number se busca con GET /api/Order/Search  (find_order_id)
    │
-   ├── coincidencia ──►  INTERNO:  POST /api/Return/CreateReturn/{orderId}
-   │                               luego AddItem → AllocateItemLocation → Confirm
+   ├── encontrada, OrderStatusId ∈ {4, 5, 6}
+   │        └──►  INTERNO:  POST /api/Return/CreateReturn/{orderId}?WarehouseId=&Reference=
+   │                        luego AddItem → AllocateItemLocation → Confirm
    │
-   └── sin coincidencia ─►  EXTERNO:  POST /api/Return/CreateExternalReturn
-                                      (los items van en la misma llamada de creación)
-                                      luego AllocateItemLocation
+   └── no encontrada ──►  EXTERNO:  POST /api/Return/CreateExternalReturn
+                                    (los items van en la misma llamada de creación)
+                                    luego AllocateItemLocation
 ```
 
-Los status ids `4, 5, 6` provienen de `models/mintsoft_order_status_model.json` — los estados
-de despachado / completado, es decir solo las órdenes que plausiblemente podrían devolverse.
+`find_order_id` prueba dos términos de búsqueda: primero el valor **crudo** del payload
+(`US#12901`), que entra por `ExternalOrderReference` — Mintsoft guarda ahí el número tal como
+vino de la tienda —, y si no hay match reintenta sin el `#` (`US12901`, que es el `OrderNumber`).
+Se filtra por `ClientId` a mano, porque `Order/Search` no lo acepta como parámetro, y se
+compara contra `OrderNumber` **y** `ExternalOrderReference`.
+
+Los status ids `4, 5, 6` (`DESPATCHED`, `INVOICED`, `INVOICEFAILED`) son los estados en los que
+la orden ya salió del depósito, es decir las únicas que plausiblemente podrían devolverse. Si la
+orden existe pero está en otro estado, se loguea el estado y **no** se crea un return interno.
+
+Si `Order/Search` falla contra la API, la excepción se propaga en vez de devolver "no
+encontrada": asumir que la orden no existe crearía un return externo de más.
+
+> **Antes** esto listaba todas las órdenes del cliente con `GET /api/Order/List` una vez por cada
+> status y buscaba el número a mano sobre el resultado. Fallaba por dos motivos a la vez: el
+> parámetro de status es `OrderStatusId` y se enviaba `statusId`, así que el filtro se ignoraba y
+> las tres llamadas devolvían las mismas 100 filas; y sin `PageNo`/`Limit` solo se veían las 100
+> órdenes más recientes. Sumado a que `_normalize_order_number` hacía `lstrip("#")` — que solo
+> saca el numeral inicial, no el del medio de `US#12901` — la orden **nunca** se encontraba: sobre
+> 1500 returns de la cuenta, 1474 estaban creados como externos y 26 como internos.
 
 Para returns externos, cuando un SKU no existe para ese cliente, el producto se **crea** al
 vuelo (`PUT /api/Product`) usando SKU, nombre de la variante y barcode, con sleeps de 3
@@ -267,12 +285,25 @@ Los ids de ubicación están hardcodeados por depósito:
 
 | Propósito | Wholesale (wh 3) | E-Commerce (wh 5) |
 |---|---|---|
-| `RET` — staging de stock bueno | `4104` | `4299` |
+| `RET` — staging de stock bueno, y destino de **todas** las cajas | `4104` | `4299` |
 | `RET-TEMP` — staging de cuarentena | `9` | `4304` |
 
-El stock dañado además pasa por
-`POST /api/Warehouse/StockMovement?Action=7` (cuarentena) antes de la transferencia, y la
-transferencia misma lleva `"Type": "Quarantine"`.
+**La cuarentena la aplica Mintsoft solo, al confirmar el return.** El motivo
+`ReturnReasonId=2` tiene `StockAction='Quarantine'` (ver `GET /api/Return/Reasons`), y el
+`Confirm` lo ejecuta: la unidad queda en `RET-TEMP` con `Type='Quarantine'` y suma a
+`InQuarantine`. El código **no** pide la cuarentena.
+
+> **Antes** se llamaba además a `POST /api/Warehouse/StockMovement?Action=7`. Esa llamada
+> fallaba **siempre** con `"Unable to Quarantine stock as not enough could be found in the
+> selected location!"`, porque para cuando corre ya no queda stock sin cuarentenar en esa
+> ubicación — la unidad ya está cuarentenada. Por eso el comment
+> `'Returned stock sent to Quarantine'` no aparece en ningún movimiento histórico de la cuenta:
+> nunca funcionó. `quarantine_stock` sigue en el cliente, documentada, para cuarentenar stock a
+> mano fuera de un return.
+
+La transferencia a la caja sí es necesaria —el `Confirm` deja la unidad **suelta**, con
+`Carton=None`— y lleva `"Type": "Quarantine"`, que es lo que le permite mover stock ya
+cuarentenado conservando el estado.
 
 ### Manejo de cajas (put-away bin)
 
@@ -283,36 +314,55 @@ escaneó el operario (`put_away_bin`):
    destino para el transfer, y el stock queda en la ubicación de staging. Los payloads de RMA
    pueden traer `put_away_bin: null` (ver `models/tb_rma_model.json`).
 2. `GET /api/StorageMedia/ValidateCarton?cartonCode=…` — ver [`check_carton`](#check_carton-y-la-detección-de-cajas-existentes) abajo.
-3. Si no existe → `POST /api/StorageMedia/CreateCarton` (`StorageMediaName: "Stock"`, ubicada en
-   la ubicación `RET` / `RET-TEMP` correspondiente, `autoGenerateSSCC=false`).
-4. `PUT /api/Warehouse/TransferStock` desde `RET`/`RET-TEMP` → código de la caja.
+3. Si no existe → `POST /api/StorageMedia/CreateCarton` (`StorageMediaName: "Stock"`,
+   `autoGenerateSSCC=false`) ubicada **siempre en `RET`**, también para los items en
+   cuarentena.
+4. `PUT /api/Warehouse/TransferStock` desde `RET` / `RET-TEMP` → código de la caja. El destino
+   es el código de caja, así que Mintsoft arrastra la unidad a la ubicación **de la caja**: un
+   item que salió de `RET-TEMP` termina en `RET`, conservando `Type='Quarantine'`.
+
+> **La caja de cuarentena se crea en `RET`, no en `RET-TEMP`**, por dos razones. Primero,
+> `RET-TEMP` es la ubicación transitoria de aislamiento, no un destino. Segundo, si la caja vive
+> en `RET-TEMP` —la misma ubicación a la que el `Confirm` asigna el item— y ya contiene ese SKU,
+> Mintsoft consolida la unidad nueva dentro de la caja y no queda nada suelto; después el
+> `TransferStock` falla con `"Could not find any of product ID: X in RET-TEMP!"`. Con la caja en
+> `RET` eso no puede pasar.
+>
+> Un mismo SKU puede acumularse legítimamente en una caja desde returns distintos (uno el lunes,
+> otro hoy), así que el transfer **siempre** se ejecuta: no se saltea por "ese SKU ya está en la
+> caja". Verificado: dos returns del mismo SKU a la misma caja dejan `Qty=2` e `InQuarantine=2`.
 
 #### `check_carton` y la detección de cajas existentes
 
-`ValidateCarton` no devuelve un "existe / no existe" limpio: devuelve un objeto `Result` y el
-único caso que comunica de forma explícita es el de **no existe**, por el texto del campo
-`Message` (`"Could not find a Carton with the code …"`). En el caso de éxito `Message` viene
-`null`. `check_carton` (`clients/mintsoftClient.py:302`) resuelve en este orden:
+`ValidateCarton` no devuelve un "existe / no existe" limpio. Devuelve un `ToolkitResult`, y en
+esta cuenta **devuelve `Success: false` para todas las cajas** — incluso para las que existen y
+tienen stock. Medido:
 
-| Respuesta | Resultado |
-|---|---|
-| `Message` empieza con `"Could not find a Carton with the code"` | `False` — hay que crear la caja |
-| No-2xx, o `WasSuccessful: false` con otro mensaje | **Excepción** con el status y el body crudo logueados |
-| 2xx sin mensaje de "no existe" (`Message: null`) | `True` — la caja existe |
-| 2xx con un mensaje inesperado | `True`, y se loguea el mensaje |
-| Body no-JSON o payload que no es un objeto | **Excepción** con el body crudo logueado |
-| `put_away_bin` vacío o `None` | `ValueError` (el service saltea el item antes de llegar acá) |
+| `cartonCode` | `Success` | `Message` | `check_carton` |
+|---|---|---|---|
+| una caja existente (`RV-RETURNS-169`, `*RV-2505-1`, …) | `false` | `"The retrieved Carton does not have a valid prefix and code! …"` | `True` ✅ |
+| un código inexistente | `false` | `"Could not find a Carton with the code …"` | `False` ✅ |
+| `""` | `false` | `"Carton code was not provided."` | `ValueError` |
 
-La versión anterior hacía `json.get("Message").startswith(...)` directo, así que **cualquier
-respuesta con `Message: null` — es decir el caso normal de caja ya existente — rompía con
-`AttributeError: 'NoneType' object has no attribute 'startswith'`** y abortaba el return
-completo, dejando el stock en `RET` / `RET-TEMP`.
+El mensaje de las cajas existentes dice *"The **retrieved** Carton…"*: Mintsoft **sí** la
+encuentra y después la rechaza por no tener un SSCC válido, probablemente porque `create_carton`
+las crea con `autoGenerateSSCC=false`. Y ese rechazo no impide nada — `TransferStock` funciona
+igual contra ellas.
 
-Para los casos ambiguos se elige deliberadamente **cortar con una excepción** en vez de adivinar:
-un `False` incorrecto haría que `CreateCarton` corra sobre un código ya existente y podría
-reubicar una caja que está en otro lado; un `True` incorrecto hace fallar el `TransferStock`
-después, que es un error recuperable. El status y el body crudo se imprimen siempre en esos
-casos, así que la próxima ocurrencia dice exactamente qué devolvió Mintsoft.
+Por eso `check_carton` mira **únicamente** si Mintsoft dice explícitamente que no la encontró:
+
+```python
+body = self._toolkit_result(response, ...)          # raise_for_status + body no-JSON
+message = body.get("Message") or ""
+return not message.startswith(self.CARTON_NOT_FOUND_PREFIX)
+```
+
+⚠️ **No cambiar esto por `return body.get("Success")`.** Daría `False` para toda caja y el código
+recrearía cajas existentes en cada return.
+
+`_toolkit_result` sí corta con excepción ante un no-2xx o un body que no es JSON, y un
+`put_away_bin` vacío o `None` levanta `ValueError` — aunque el service saltea esos items antes de
+llegar acá.
 
 El `cartonCode` se manda por `params=` y no interpolado en la URL: los códigos escaneados pueden
 traer `#`, `&`, `%` o espacios, que romperían el querystring.
@@ -376,8 +426,9 @@ API key devuelta se envía en el header `ms-apikey` en cada llamada. Todos los t
 | Método | Endpoint | Método del cliente |
 |---|---|---|
 | `POST` | `/api/Auth` | `_authenticate` |
-| `GET` | `/api/Order/List?clientId=&statusId=` | `get_orders` |
-| `POST` | `/api/Return/CreateReturn/{orderId}` | `create_return` |
+| `GET` | `/api/Order/Search?OrderNumber=&exactMatch=true` | `search_orders` |
+| `GET` | `/api/Order/List?ClientId=&OrderStatusId=&PageNo=&Limit=` | `get_orders` *(sin uso en el flujo)* |
+| `POST` | `/api/Return/CreateReturn/{orderId}?WarehouseId=&Reference=` | `create_return` |
 | `POST` | `/api/Return/CreateExternalReturn` | `create_external_return` |
 | `GET` | `/api/Return/{id}` | `get_return_details` |
 | `POST` | `/api/Return/{id}/AddItem` | `add_return_item` |
@@ -388,7 +439,7 @@ API key devuelta se envía en el header `ms-apikey` en cada llamada. Todos los t
 | `GET` | `/api/Product/SearchBarcode?Barcode=` | `get_sku_dado_barcode` |
 | `PUT` | `/api/Product` | `create_product` |
 | `PUT` | `/api/Warehouse/TransferStock` | `transfer_stock` |
-| `POST` | `/api/Warehouse/StockMovement?Action=7` | `quarantine_stock` |
+| `POST` | `/api/Warehouse/StockMovement?Action=7` | `quarantine_stock` *(sin uso en el flujo — ver [Disposition](#disposition--return-reason--ubicación))* |
 | `GET` | `/api/Warehouse/{id}/Location/All` | `get_warehouse_locations` *(dump de referencia)* |
 | `GET` | `/api/StorageMedia/ValidateCarton?cartonCode=` | `check_carton` |
 | `POST` | `/api/StorageMedia/CreateCarton?autoGenerateSSCC=false&clientId=` | `create_carton` |
@@ -445,10 +496,19 @@ absorben.
 
 ### Referencia del return usada en los reportes
 
-Cada vez que se reporta un error, el return se identifica con
-`line_items[0].tracking_number`, o — si no está — con `"{completed_at}-{customer.email}"`.
-Para returns externos ese mismo valor se convierte en el `Reference` de Mintsoft (truncado a
-50 caracteres).
+`_return_identifier(data)` es el único lugar donde se calcula, con esta prioridad:
+
+1. `line_items[0].tracking_number`
+2. si viene vacío (`null`, `""` o solo espacios), `storefront_order_number`
+3. como último recurso, `"{completed_at}-{customer.email}"` — para que el `POREference` del mail
+   de error nunca quede en `UNKNOWN`
+
+Ese valor va como `Reference` de Mintsoft (truncado a 50 caracteres) en **las dos** ramas,
+interna y externa, y es el mismo con el que se identifica el return en los reportes de error.
+
+> **Antes** solo la rama externa seteaba `Reference`; la interna no. No se notaba porque casi
+> todos los returns salían externos, pero al arreglar la búsqueda de órdenes los internos
+> quedaban sin `Reference` y no se podían encontrar por PO reference en Mintsoft.
 
 ### Política de reintentos
 
@@ -497,20 +557,23 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
 
 1. **El webhook siempre responde `200`.** Las fallas solo se ven en la planilla de errores, en
    el mail de alerta (hoy desactivado) y en los logs. Two Boxes nunca va a reintentar.
-2. **Los mails de alerta no se envían realmente** — `login`/`send_message` están comentados
-   (`services/mintsoft_service.py`, marcados con `CAMBIAR`), y aun así se loguea una línea de
-   éxito.
+2. **Los mails de alerta sí se envían.** Ya no hay nada comentado en `_send_error_email`. Como
+   `map_client` se invoca en varios puntos del flujo, un mismo payload malo puede generar varias
+   alertas idénticas; no hay deduplicación.
 3. **`alert_email_to` tiene una coma final**, lo que la convierte en una tupla en lugar de un
    string, y está hardcodeada en vez de leerse de `ALERT_EMAIL_TO`.
-4. **Los returns internos ignoran el warehouse mapeado**: `create_return` llama a
-   `self.client.create_return(order_id, warehouse_id=3)`, y `MintsoftOrderClient.create_return`
-   no le envía `warehouse_id` a Mintsoft en absoluto. La asignación posterior *sí* respeta el
-   warehouse mapeado.
-5. **El `9` está etiquetado de forma inconsistente** — `RET-TEMP Wholesale` en un lugar y
-   `RET-QT Wholesale` en otro. Es el mismo id de ubicación en ambos casos.
-6. **En `add_return_items`, `returns_location_id` se asigna en el paso 1 y se recalcula en el
-   paso 2**; solo se usa el valor del paso 2 (el que considera el warehouse) para la asignación.
-   La asignación del paso 1, incluida la constante `2363` (`RET-QT`), es código muerto.
+4. **Los returns internos ya respetan el warehouse mapeado.** `create_return` pasa
+   `map_warehouse(merchant)` en vez de un `3` fijo, y el cliente lo envía como query param
+   `WarehouseId`. Antes recibía el argumento y no lo mandaba, así que Mintsoft usaba el warehouse
+   de la orden mientras el log decía otra cosa.
+5. **La ubicación `9` es `RET-TEMP` en wholesale**, no `RET-QT`. El comentario que decía
+   `RET-QT Wholesale` estaba mal: `RET-QT` es otra ubicación (id `2363`, `LocationTypeId=5` =
+   `GOODS IN`, solo en wh 3) que el código no usa. Verificado por API.
+6. **Mintsoft no tiene un tipo de ubicación de cuarentena.** Los tipos son `PICK`, `ALLOCATE`,
+   `BINS`, `NO PICK`, `BULK`, `Wholesale`, `REPLEN`, `OFFHAND`, `GOODS IN`, `REPLEN TROLLEY`,
+   `PICKING TOTE`, `CROSSDOCK`, `PACKING`. La cuarentena es un **estado del stock**
+   (`Type='Quarantine'` / `InQuarantine`), y convive con ubicación y caja: una unidad puede estar
+   en cuarentena dentro de una caja en `RET`.
 7. **`get_product_id` se llama repetidamente** para el mismo SKU en `create_return`,
    `add_return_items` (dos veces) y `reallocate_return_items` — sin ningún cacheo.
 8. **`get_product_id` arma una URL con doble slash** (`…co.uk//api/Product/Search`), que
@@ -523,8 +586,11 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
    items siguientes** y ese stock queda en `RET` / `RET-TEMP`.
 10. **`allocate_external_return_items` sobreescribe el parámetro `data`** dentro de su loop; el
     manejador de errores se protege de eso con un chequeo de `isinstance` / `"event_data" in data`.
-11. **El manejador de errores de `add_return_items` referencia `new_identifier`**, que queda sin
-    definir cuando *sí* había tracking number — convirtiendo ese camino en un `NameError`.
+11. **Los manejadores de error ya no recalculan el identificador a mano.** Los cuatro usan
+    `_return_identifier(data)`, que es defensivo. Antes hacían `line_items[0].get(...)` y
+    `event_data["customer"]` dentro del propio `except`, así que con una lista vacía o un
+    `customer` ausente **lanzaban dentro del handler y tapaban el error real** — que es
+    exactamente cómo se perdió la causa de una falla de producción.
 12. **Dos `sleep` de 3 segundos** rodean la creación de productos al vuelo, ocupando un thread
     del pool de 10 slots por más de 6 segundos por cada SKU nuevo.
 13. **`mappers/main_mapper.py` (`map_return`) no se usa** en el flujo del request, y
@@ -548,6 +614,23 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
     mismo return físico — o reintenta una entrega — se crean **dos returns separados** en Mintsoft.
     Como los payloads de RMA traen varios `line_items` con el mismo `tracking_number` y los de
     Work Capture traen uno solo, dos eventos para el mismo return físico es un escenario real.
+
+18. **La `ms-apikey` vence a las 24 horas y no se renueva.** El spec de `POST /api/Auth` lo dice
+    explícitamente. `MintsoftOrderClient` la pide una sola vez en el constructor y `listener.py`
+    instancia el service a nivel de módulo, así que cualquier worker con más de un día de uptime
+    empieza a devolver `401` en todas las llamadas hasta que se redespliegue. **Pendiente.**
+19. **`create_product` no envía `Weight`**, que el schema `Product` marca como requerido junto
+    con `SKU`. Se mandan solo SKU, Name, EAN y ClientId, así que crear un SKU al vuelo durante un
+    return externo puede volver con `Success: false`. **Pendiente.**
+20. **El merchant se busca en tres lugares.** `event_data['merchant_integration']['merchant']`
+    (que no existe en estos payloads), `event_data['line_items'][0]['merchant']` y
+    `event_data['merchant']`. Antes solo se miraban los dos primeros, así que cualquier evento
+    sin `line_items` devolvía `""` y disparaba la alerta de "cliente no mapeado" con el nombre
+    vacío, aunque el merchant estuviera en el payload al lado. `map_client` ahora distingue los
+    dos casos: con nombre vacío manda "Payload sin merchant".
+21. **`listener.py` no mira `event_type`.** Todo `POST` a `/webhook` va a `procesar_webhook`, sea
+    `return-complete` o cualquier otro tipo que Two Boxes mande, y los otros tipos pueden tener
+    otra forma de payload.
 
 ### Agregar un merchant
 
