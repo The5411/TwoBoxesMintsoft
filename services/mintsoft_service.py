@@ -22,18 +22,39 @@ from mappers.mintsoft_mapper import map_client, map_warehouse
 def _normalize_order_number(value) -> str:
     """Normaliza un número de orden para poder compararlo.
 
-    Two Boxes suele mandar el storefront_order_number con '#' adelante (ej '#2131WF')
-    y en Mintsoft la orden está sin él ('2131WF'), así que sacamos el '#' y los espacios
-    y comparamos en mayúsculas.
+    Two Boxes manda el storefront_order_number con '#' y no siempre adelante:
+    ROVE usa 'US#12901' (numeral en el medio) y en Mintsoft esa orden es
+    OrderNumber='US12901'. El .lstrip('#') anterior solo sacaba el numeral
+    inicial, así que 'US#12901' quedaba igual y nunca matcheaba: TODOS los
+    returns de ROVE terminaban creados como externos. Ahora sacamos el '#'
+    esté donde esté.
     """
-    return str(value or "").strip().lstrip("#").strip().upper()
+    return str(value or "").replace("#", "").strip().upper()
+
+
+def _order_number_variants(value) -> List[str]:
+    """Términos de búsqueda a probar en Order/Search, sin repetir.
+
+    Primero el valor crudo: Order/Search matchea ExternalOrderReference, que en
+    Mintsoft guarda el número tal como vino de la tienda ('US#12901'), así que
+    el crudo suele entrar de una. Después la versión sin '#' por si la orden
+    quedó cargada solo como OrderNumber.
+    """
+    raw = str(value or "").strip()
+    variants = []
+    for candidate in (raw, raw.replace("#", "").strip()):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
 
 
 class MintsoftReturnService:
     def __init__(self, logger_name: str = "mintsoft_service", log_file: str = "m_service.log"):
         self.logger = get_logger(logger_name, log_file)
         self.client = MintsoftOrderClient()
-        self.status_ids = [4, 5, 6]
+        # Estados en los que una orden ya salió del depósito y por lo tanto se
+        # le puede crear un return: 4=DESPATCHED, 5=INVOICED, 6=INVOICEFAILED.
+        self.returnable_status_ids = {4, 5, 6}
 
         # ----- Email notification config (read from environment) -----
         self.smtp_host = os.environ.get("SMTP_HOST")
@@ -140,71 +161,127 @@ class MintsoftReturnService:
         except Exception:
             return None
 
-    def fetch_mintsoft_orders(self, data) -> List[Dict]:
-        self.logger.info("Starting to fetch Mintsoft orders")
+    def find_order_id(self, data) -> Optional[int]:
+        """Busca en Mintsoft la orden a la que corresponde este return.
+
+        Usa /api/Order/Search en vez de listar todas las órdenes del cliente.
+        Antes esto hacía Order/List una vez por cada status (4, 5, 6) y buscaba
+        el número a mano sobre el resultado, lo cual fallaba por dos motivos a
+        la vez:
+
+          1. Order/List recibe OrderStatusId, no statusId, así que el filtro se
+             ignoraba y las tres llamadas devolvían las MISMAS 100 filas.
+          2. Sin PageNo/Limit solo se veían las 100 órdenes más recientes del
+             cliente, así que cualquier orden de más de unos días no aparecía.
+
+        Resultado: la orden existía en Mintsoft pero no se encontraba, y el
+        return se creaba como externo. Order/Search resuelve ambas cosas con una
+        sola llamada y matchea también ExternalOrderReference.
+
+        Devuelve el OrderId, o None si la orden no está (ahí sí corresponde un
+        return externo). Si la búsqueda falla contra la API, propaga la
+        excepción: no podemos asumir "no existe" y crear un externo de más.
+        """
+        order_number = self._safe_get_storefront_order_number(data)
+        if not order_number:
+            self.logger.warning("Payload sin storefront_order_number, no se puede buscar la orden")
+            return None
 
         merchant_name = self._get_merchant_name(data)
-        client_id = map_client(merchant_name) # Si no encuentra devuelve None
+        client_id = map_client(merchant_name)
+        target = _normalize_order_number(order_number)
 
-        if client_id is None:
-            print ("Client not in Mintsoft, return cannot be processed")
-            return None
-
-        all_orders: List[Dict] = []
-        try:
-            for status_id in self.status_ids:
-                self.logger.info(f"Fetching orders with status ID: {status_id}")
-                orders = self.client.get_orders(client_id=client_id, status_id=status_id)
-                self.logger.info(f"Fetched {len(orders)} orders with status ID {status_id} from Mintsoft")
-                all_orders.extend(orders)
-
-            self.logger.info(f"Fetched {len(all_orders)} orders from Mintsoft (total)")
-            return all_orders
-
-        except Exception as e:
-            self.logger.error(f"Error fetching Mintsoft orders: {e}", exc_info=True)
-            event_data = data["event_data"]
-            line_items = event_data.get("line_items", [])
-            return_identifier = line_items[0].get("tracking_number") # Si hay, es el tracking number
-
-            if return_identifier is None:
-                completed_at = event_data.get("completed_at")
-                customer_email = event_data["customer"].get("email")
-                new_identifier = f"{completed_at}-{customer_email}"
-                return_identifier = new_identifier
-
-            self._send_error_email(
-                method="fetch_mintsoft_orders",
-                error=e,
-                order_reference=return_identifier,
-                context={"merchant_name": merchant_name, "client_id": client_id},
+        for term in _order_number_variants(order_number):
+            candidates = self.client.search_orders(term)
+            self.logger.info(
+                f"Order/Search({term!r}) devolvió {len(candidates)} orden(es)"
             )
-            return []
 
-    def match_rma_order(self, orders: List[Dict], data) -> Optional[int]:
-        self.logger.info("Starting to match RMA order with Mintsoft orders")
+            matches = []
+            for order in candidates:
+                if client_id is not None and order.get("ClientId") != client_id:
+                    continue
+                if target in (
+                    _normalize_order_number(order.get("OrderNumber")),
+                    _normalize_order_number(order.get("ExternalOrderReference")),
+                ):
+                    matches.append(order)
 
-        rma_order_name = self._get_storefront_order_number(data)
-        try:
-            target = _normalize_order_number(rma_order_name)
+            if not matches:
+                continue
 
-            if not target:
-                #self.logger.warning("Empty storefront_order_number, cannot match against Mintsoft orders")
+            returnable = [
+                o for o in matches
+                if o.get("OrderStatusId") in self.returnable_status_ids
+            ]
+
+            if not returnable:
+                # La orden existe pero todavía no salió del depósito (o está
+                # cancelada). No le creamos un return interno.
+                estados = [o.get("OrderStatusId") for o in matches]
+                self.logger.warning(
+                    f"Orden {order_number} encontrada en Mintsoft pero en estado(s) "
+                    f"{estados}, fuera de {sorted(self.returnable_status_ids)}. "
+                    f"No se crea return interno."
+                )
                 return None
 
-            for order in orders:
-                if _normalize_order_number(order.get("OrderNumber")) == target:
-                    self.logger.info(f"Found matching order in Mintsoft for RMA order name: {rma_order_name}")
+            if len(returnable) > 1:
+                self.logger.warning(
+                    f"Orden {order_number} matcheó {len(returnable)} órdenes de Mintsoft "
+                    f"({[o.get('ID') for o in returnable]}); uso la primera."
+                )
 
-                    return order.get("ID")
+            order = returnable[0]
+            self.logger.info(
+                f"Orden {order_number} -> Mintsoft OrderId={order.get('ID')} "
+                f"(OrderNumber={order.get('OrderNumber')!r}, "
+                f"ExternalOrderReference={order.get('ExternalOrderReference')!r}, "
+                f"OrderStatusId={order.get('OrderStatusId')})"
+            )
+            return order.get("ID")
 
-            self.logger.warning(f"No matching order found in Mintsoft for RMA order name: {rma_order_name}")
-            return None
+        self.logger.info(
+            f"Orden {order_number} no encontrada en Mintsoft para ClientId {client_id}"
+        )
+        return None
 
-        except Exception:
-            return None
+    def _return_identifier(self, data) -> str:
+        """Reference con el que se guarda el return en Mintsoft.
+
+        TODO return, externo o interno, tiene que llevar Reference: es lo que
+        después se busca como "PO reference" en Mintsoft. Prioridad:
+
+          1. tracking_number del primer line item
+          2. si viene vacío, el storefront_order_number
+
+        Si no hubiera ninguno de los dos se cae a completed_at + mail del
+        cliente, para que al menos el mail de error identifique el return.
+        """
+        event_data = data.get("event_data") or {}
+        line_items = event_data.get("line_items") or []
+
+        if line_items:
+            tracking = str((line_items[0] or {}).get("tracking_number") or "").strip()
+            if tracking:
+                return tracking
+
+        order_number = str(self._safe_get_storefront_order_number(data) or "").strip()
+        if order_number:
+            return order_number
+
+        completed_at = event_data.get("completed_at")
+        customer_email = (event_data.get("customer") or {}).get("email")
+        return f"{completed_at}-{customer_email}"
 
     def create_return(self, data) -> Optional[int]:
+        # Se inicializan acá porque el except de abajo los mete en el context del
+        # mail: si algo falla antes de asignarlos, el propio handler tiraba NameError.
+        merchant_name = None
+        client_id = None
+        warehouse = None
+        order_id = None
+
         try:
             merchant_name = self._get_merchant_name(data)
             client_id = map_client(merchant_name) # Si no encuentra devuelve None
@@ -214,22 +291,14 @@ class MintsoftReturnService:
                     print ("Client not in Mintsoft, return cannot be processed")
                     return None, "No Return Created"
 
-            orders = self.fetch_mintsoft_orders(data)
-            order_id = self.match_rma_order(orders, data)
+            order_id = self.find_order_id(data)
 
-    
             if order_id is None: # Si es un external return
                 self.logger.info("Order not found in Mintsoft. Creating EXTERNAL return.")
 
                 event_data = data["event_data"]
                 line_items = event_data.get("line_items", [])
-                return_identifier = line_items[0].get("tracking_number") # Si hay, es el tracking number
-
-                if return_identifier is None:
-                    completed_at = event_data.get("completed_at")
-                    customer_email = event_data["customer"].get("email")
-                    new_identifier = f"{completed_at}-{customer_email}"
-                    return_identifier = new_identifier
+                return_identifier = self._return_identifier(data)
 
                 external_return_data = {
                     "Reference": return_identifier[:50],
@@ -287,28 +356,35 @@ class MintsoftReturnService:
                 return external_return_id, "External Return Created" # Crea Return Externa (con el Order ID)
 
             # Si es un Internal Return
-            self.logger.info(f"Order found (ID={order_id}). Creating standard return on Warehouse ID = {3}.")
-            return_id = self.client.create_return(order_id, warehouse_id = 3)
+            # El warehouse sale del mapeo del cliente (3 = Wholesale, 5 = E-Comm),
+            # no de un 3 fijo. Antes se pasaba warehouse_id=3 y encima el cliente
+            # no lo mandaba en la request, asi que Mintsoft usaba el warehouse de
+            # la orden mientras el log decia "Warehouse ID = 3".
+            #
+            # El Reference va también acá: la rama externa siempre lo seteaba y la
+            # interna no, así que un return interno quedaba sin PO reference y no se
+            # podía encontrar en Mintsoft. Antes no se notaba porque la búsqueda de
+            # orden estaba rota y TODOS los returns salían externos.
+            return_identifier = self._return_identifier(data)
+            self.logger.info(
+                f"Order found (ID={order_id}). Creating standard return on WarehouseId={warehouse} "
+                f"(merchant {merchant_name!r}, Reference={return_identifier[:50]!r})."
+            )
+            return_id = self.client.create_return(
+                order_id,
+                warehouse_id=warehouse,
+                reference=return_identifier[:50],
+            )
 
             self.logger.info(f"Created return with ID: {return_id}")
             return return_id, "Internal Return Created"
 
         except Exception as e:
             self.logger.error(f"Error creating return: {e}", exc_info=True)
-            event_data = data["event_data"]
-            line_items = event_data.get("line_items", [])
-            return_identifier = line_items[0].get("tracking_number") # Si hay, es el tracking number
-
-            if return_identifier is None:
-                completed_at = event_data.get("completed_at")
-                customer_email = event_data["customer"].get("email")
-                new_identifier = f"{completed_at}-{customer_email}"
-                return_identifier = new_identifier
-                
             self._send_error_email(
                 method="create_return",
                 error=e,
-                order_reference=return_identifier,
+                order_reference=self._return_identifier(data),
                 context={
                     "merchant_name": merchant_name,
                     "client_id": client_id,
@@ -512,13 +588,31 @@ class MintsoftReturnService:
         event_data = data.get("event_data")
         line_items = event_data.get("line_items", [])
 
+        # response se inicializa porque solo se asigna dentro del loop: si no hay
+        # line_items (o se saltean todos) el `return response` del final tiraba
+        # UnboundLocalError.
+        response = None
+        # Items sin put_away_bin: no se pueden mover a ninguna caja. Se saltean
+        # para no bloquear a los demas, y al final se lanza para que salga el mail.
+        sin_caja: List[str] = []
+
         try:
             for item in line_items:
                 sku = item.get("sku")
                 sku, product_id = self.client.get_product_id(sku, client_id, item.get("barcode"))
                 merchant = self._get_merchant_name(data)
                 warehouse = map_warehouse(merchant) # 3 si es Wholesale, 5 si es E-Comm
-                carton_code = item.get("put_away_bin")
+                carton_code = (item.get("put_away_bin") or "").strip()
+
+                if not carton_code:
+                    # Sin caja destino, el TransferStock iria a DestinationNameOrCode=""
+                    # y antes ademas check_carton devolvia True para el codigo vacio.
+                    self.logger.error(
+                        f"Item {sku} sin put_away_bin: no hay caja destino, se saltea la "
+                        f"reubicacion de stock."
+                    )
+                    sin_caja.append(str(sku))
+                    continue
 
                 disposition = item.get("disposition")
                 if disposition == "Return to Stock": # Stock en buenas condiciones
@@ -599,6 +693,11 @@ class MintsoftReturnService:
                     response = self.client.transfer_stock(reallocation_data)
                     print(response)
 
+            if sin_caja:
+                raise RuntimeError(
+                    f"Items sin put_away_bin, no se les pudo reubicar el stock: "
+                    f"{', '.join(sin_caja)}"
+                )
 
             return response
 

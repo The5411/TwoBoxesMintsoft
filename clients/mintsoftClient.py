@@ -23,6 +23,12 @@ class MintsoftOrderClient:
         self.api_key = self._authenticate()
 
     def _authenticate(self) -> str:
+        """Pide una ms-apikey a Mintsoft.
+
+        NO imprimir ni loguear la key: es una credencial. Antes se hacía
+        print(r.json()) acá, así que la key quedaba en texto plano en los logs
+        de producción en cada arranque de worker.
+        """
         url = f"{self.BASE_URL}/api/Auth"
 
         payload = {
@@ -32,8 +38,27 @@ class MintsoftOrderClient:
 
         r = requests.post(url, json=payload, timeout=120)
         r.raise_for_status()
-        print(r.json())
         return r.json()
+
+    @staticmethod
+    def _toolkit_result(r, what: str) -> Dict[str, Any]:
+        """Valida una respuesta de Mintsoft que devuelve un ToolkitResult.
+
+        Mintsoft contesta 200 con {"Success": false, "Message": "..."} cuando
+        rechaza la operacion, asi que mirar solo el status code no alcanza:
+        hay que mirar Success. Sin esto un rechazo pasaba desapercibido.
+        """
+        r.raise_for_status()
+        try:
+            body = r.json()
+        except ValueError as e:
+            raise RuntimeError(
+                f"{what}: Mintsoft devolvio {r.status_code} con un cuerpo que no es JSON: "
+                f"{(r.text or '')[:300]!r}"
+            ) from e
+        if not isinstance(body, dict):
+            raise RuntimeError(f"{what}: se esperaba un objeto, llego {type(body).__name__}: {body!r}")
+        return body
 
     def headers(self) -> Dict[str, str]:
         return {
@@ -42,34 +67,94 @@ class MintsoftOrderClient:
             "Accept": "application/json",
         }
 
-    def get_orders(self, client_id: Optional[int] = None, status_id: Optional[int] = None) -> List[Dict[str, Any]]:
-        url = f"{self.BASE_URL}/api/Order/List?clientId={client_id}"
+    def get_orders(self, client_id: Optional[int] = None, status_id: Optional[int] = None,
+                   page_no: int = 1, limit: int = 100) -> List[Dict[str, Any]]:
+        """Lista ordenes paginadas.
 
+        Ojo: el parametro de status se llama OrderStatusId, NO statusId. Con
+        'statusId' la API no bindea nada y devuelve TODAS las ordenes sin
+        filtrar (probado: statusId=4 y statusId=5 devolvian exactamente las
+        mismas 100 filas, con OrderStatusIds 1, 5 y 17 mezclados).
+        Para encontrar UNA orden puntual usar search_orders(), que no pagina.
+        """
+        url = f"{self.BASE_URL}/api/Order/List"
+
+        params: Dict[str, Any] = {
+            "ClientId": client_id,
+            "PageNo": page_no,
+            "Limit": limit,
+        }
         if status_id is not None:
-            url += f"&statusId={status_id}"
-            
+            params["OrderStatusId"] = status_id
+
         r = requests.get(
             url,
             headers=self.headers(),
+            params=params,
             timeout=120,
         )
 
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        return data if isinstance(data, list) else []
+
+    def search_orders(self, order_number: str, exact_match: bool = True,
+                      include_order_items: bool = False) -> List[Dict[str, Any]]:
+        """Busca ordenes por OrderNumber, TrackingNumber o ExternalOrderReference.
+
+        Devuelve hasta 10 ordenes, la mas reciente primero. No filtra por
+        cliente, asi que el caller tiene que chequear ClientId.
+        """
+        url = f"{self.BASE_URL}/api/Order/Search"
+
+        r = requests.get(
+            url,
+            headers=self.headers(),
+            params={
+                "OrderNumber": order_number,
+                "exactMatch": "true" if exact_match else "false",
+                "includeOrderItems": "true" if include_order_items else "false",
+            },
+            timeout=120,
+        )
+
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        return [data] if data else []
     
-    def create_return(self, order_id:int, warehouse_id: Optional[int] = None, client_id: Optional[int] = None):
+    def create_return(self, order_id: int, warehouse_id: Optional[int] = None,
+                      reference: Optional[str] = None):
+        """Crea un return interno contra una orden.
+
+        WarehouseId y Reference van como query params. Antes se recibia
+        warehouse_id y no se mandaba a ningun lado, asi que Mintsoft creaba el
+        return en el warehouse de la orden mientras el log decia otra cosa.
+        Si warehouse_id es None se mantiene ese comportamiento (lo elige Mintsoft).
+        """
         url = f"{self.BASE_URL}/api/Return/CreateReturn/{order_id}"
 
+        params: Dict[str, Any] = {}
+        if warehouse_id is not None:
+            params["WarehouseId"] = warehouse_id
+        if reference:
+            params["Reference"] = reference
+
         r = requests.post(
-            url, 
+            url,
             headers=self.headers(),
+            params=params,
+            timeout=120,
         )
-        
-        r.raise_for_status()
-        response = r.json()
-        return_id = response.get("ID")
-        print(response)
-        return return_id
+
+        response = self._toolkit_result(r, f"Return/CreateReturn/{order_id}")
+        if not response.get("Success"):
+            raise RuntimeError(
+                f"Mintsoft rechazo CreateReturn para la orden {order_id}: "
+                f"{response.get('Message')!r}"
+            )
+        return response.get("ID")
 
     def create_external_return(self, data:Dict[str, Any]):
         print("data", data)
@@ -81,16 +166,21 @@ class MintsoftOrderClient:
             json=data
         )
 
-        r.raise_for_status()
-        response = r.json()
-        # Si el response es succes .get("Success") si es false,  llamar a /api/Product/SearchBarcode
-        # Cambiar data con lo que llega como productId y volver a llamar a /api/Return/CreateExternalReturn 
-        
-        print("resp",response)
-        
-        return_id = response.get("ID")
-        
-        return return_id
+        response = self._toolkit_result(r, "Return/CreateExternalReturn")
+        print("resp", response)
+
+        # Mintsoft contesta 200 con Success=false cuando rechaza el return (por
+        # ejemplo un ProductId que no existe). Antes se devolvia response["ID"]
+        # sin mirar Success, asi que el ID falso seguia camino y los pasos
+        # siguientes allocaban contra un return que no existia.
+        if not response.get("Success"):
+            raise RuntimeError(
+                f"Mintsoft rechazo CreateExternalReturn: {response.get('Message')!r} "
+                f"(ClientId={data.get('ClientId')}, WarehouseId={data.get('WarehouseId')}, "
+                f"Reference={data.get('Reference')!r})"
+            )
+
+        return response.get("ID")
     
     def add_return_item(self, return_id: int, item_data: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.BASE_URL}/api/Return/{return_id}/AddItem"
@@ -146,7 +236,13 @@ class MintsoftOrderClient:
         return data
     
     def transfer_stock(self, data: Dict):
-        url = f"{self.BASE_URL}/api/Warehouse/TransferStock"          
+        """Mueve stock entre ubicaciones/cajas. Lanza si Mintsoft lo rechaza.
+
+        Antes no habia raise_for_status() ni chequeo de Success, asi que un
+        rechazo se devolvia como un dict cualquiera y el caller lo imprimia
+        como si hubiera funcionado.
+        """
+        url = f"{self.BASE_URL}/api/Warehouse/TransferStock"
 
         r = requests.put(
             url,
@@ -155,9 +251,17 @@ class MintsoftOrderClient:
             timeout=120,
         )
 
-        return r.json()
+        response = self._toolkit_result(r, "Warehouse/TransferStock")
+        if not response.get("Success"):
+            raise RuntimeError(
+                f"Mintsoft rechazo TransferStock ({data.get('SourceNameOrCode')!r} -> "
+                f"{data.get('DestinationNameOrCode')!r}, ProductId={data.get('ProductId')}, "
+                f"Quantity={data.get('Quantity')}): {response.get('Message')!r}"
+            )
+        return response
 
     def quarantine_stock(self, request):
+        """Manda stock a cuarentena (StockMovement Action=7). Lanza si falla."""
         url = f"{self.BASE_URL}/api/Warehouse/StockMovement?Action=7"
 
         r = requests.post(
@@ -167,7 +271,15 @@ class MintsoftOrderClient:
             timeout=120
         )
 
-        return r.json()
+        response = self._toolkit_result(r, "Warehouse/StockMovement?Action=7")
+        if not response.get("Success"):
+            raise RuntimeError(
+                f"Mintsoft rechazo StockMovement/Quarantine "
+                f"(ProductId={request.get('ProductID') or request.get('ProductId')}, "
+                f"LocationId={request.get('LocationId')}, Quantity={request.get('Quantity')}): "
+                f"{response.get('Message')!r}"
+            )
+        return response
 
     def get_currencies(self):
         url = f"{self.BASE_URL}/api/RefData/Currencies"
@@ -299,29 +411,66 @@ class MintsoftOrderClient:
     
 
     
-    def check_carton (self, carton_code):
-        url = f'{self.BASE_URL}/api/StorageMedia/ValidateCarton?cartonCode={carton_code}'
+    # ValidateCarton NO sirve como chequeo de existencia en esta cuenta: devuelve
+    # Success=false para TODAS las cajas (probado con RV-RETURNS-* y *RV-2505-*),
+    # con el mensaje "The retrieved Carton does not have a valid prefix and code!".
+    # Ese mensaje significa que la caja EXISTE (Mintsoft la "retrieved") pero no
+    # tiene un SSCC valido -- probablemente porque create_carton las crea con
+    # autoGenerateSSCC=false. Y no impide nada: TransferStock funciona igual
+    # contra esas cajas. Por eso lo unico que miramos es si Mintsoft dice
+    # explicitamente que no la encontro; NO mirar Success, que daria False
+    # siempre y haria recrear cajas existentes en cada return.
+    _CARTON_NOT_FOUND_PREFIX = "Could not find a Carton with the code"
 
-        response = requests.get(url, headers=self.headers())
+    def check_carton(self, carton_code) -> bool:
+        """True si la caja existe en Mintsoft, False si Mintsoft dice que no está.
 
-        json = response.json()
+        Lanza ValueError si no viene codigo: antes, con carton_code vacio,
+        Mintsoft contestaba "Carton code was not provided." y esta funcion
+        devolvia True (porque el mensaje no arranca con el prefijo de
+        not-found), asi que el caller se salteaba crear la caja y despues
+        transferia stock a un destino vacio.
+        """
+        if not str(carton_code or "").strip():
+            raise ValueError("check_carton: carton_code vacio (put_away_bin sin valor)")
 
-        message = json.get("Message")
+        url = f'{self.BASE_URL}/api/StorageMedia/ValidateCarton'
 
-        if message.startswith("Could not find a Carton with the code"):
-            
-            return False
-        
-        else:
+        r = requests.get(
+            url,
+            headers=self.headers(),
+            params={"cartonCode": carton_code},
+            timeout=120,
+        )
 
-            return True
+        body = self._toolkit_result(r, f"StorageMedia/ValidateCarton({carton_code})")
+        message = body.get("Message") or ""
+
+        return not message.startswith(self._CARTON_NOT_FOUND_PREFIX)
 
     def create_carton(self, carton_data, client_id):
-        url = f'{self.BASE_URL}/api/StorageMedia/CreateCarton?autoGenerateSSCC=false&clientId={client_id}'
+        """Crea una caja. Lanza si la request falla; si Mintsoft la rechaza, loguea.
 
-        r = requests.post(url, json = carton_data, headers=self.headers())
+        No lanzamos con Success=false a proposito: un rechazo benigno (por
+        ejemplo que la caja ya exista) no deberia tumbar el return entero, y el
+        TransferStock que viene despues ahora si falla ruidosamente si la caja
+        realmente no se puede usar.
+        """
+        url = f'{self.BASE_URL}/api/StorageMedia/CreateCarton'
 
-        return None
+        r = requests.post(
+            url,
+            json=carton_data,
+            headers=self.headers(),
+            params={"autoGenerateSSCC": "false", "clientId": client_id},
+            timeout=120,
+        )
+
+        response = self._toolkit_result(r, "StorageMedia/CreateCarton")
+        if not response.get("Success"):
+            print(f"⚠️ Mintsoft rechazó CreateCarton {carton_data.get('Code')!r}: "
+                  f"{response.get('Message')!r}")
+        return response
     
     def create_product(self, product_data):
         url = f'{self.BASE_URL}/api/Product'
