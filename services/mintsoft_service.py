@@ -48,6 +48,17 @@ def _order_number_variants(value) -> List[str]:
     return variants
 
 
+def _is_missing(item) -> bool:
+    """True si el item nunca llegó físicamente al depósito.
+
+    Two Boxes lo marca con disposition='Missing': el cliente declaró la devolución
+    pero la unidad no apareció. No hay nada que dar de alta en Mintsoft, nada que
+    ubicar, y -- importante -- no corresponde reclamarle `put_away_bin`, porque no
+    hay unidad que guardar en ninguna caja.
+    """
+    return str((item or {}).get("disposition") or "").strip() == "Missing"
+
+
 def _get_item_barcode(item) -> Optional[str]:
     """Barcode de un line item de Two Boxes.
 
@@ -325,6 +336,18 @@ class MintsoftReturnService:
                     print ("Client not in Mintsoft, return cannot be processed")
                     return None, "No Return Created"
 
+            # Un return en el que NINGUNA unidad llegó no tiene nada que registrar.
+            # Antes se creaba igual: la rama externa armaba ReturnItems=[] (porque
+            # los Missing se saltean) y la interna creaba un return vacío que
+            # después se confirmaba sin items.
+            todos_los_items = (data.get("event_data") or {}).get("line_items") or []
+            if todos_los_items and all(_is_missing(li) for li in todos_los_items):
+                self.logger.info(
+                    f"Los {len(todos_los_items)} item(s) del return están Missing: no "
+                    f"llegó ninguna unidad al depósito, no se crea return en Mintsoft."
+                )
+                return None, "No Return Created"
+
             order_id = self.find_order_id(data)
 
             if order_id is None: # Si es un external return
@@ -384,8 +407,11 @@ class MintsoftReturnService:
                     if disposition == "Return to Stock":
                         return_reason = 1
 
-                    elif disposition == "Missing":
-                        print(f"Item {sku} faltante en el return")
+                    elif _is_missing(item):
+                        self.logger.info(
+                            f"Item {sku} con disposition='Missing': no llegó, no se "
+                            f"agrega al return externo."
+                        )
                         continue
 
                     else:
@@ -538,9 +564,12 @@ class MintsoftReturnService:
                 item = item or {}  # un line_item null rompia el loop entero
                 disposition = item.get("disposition")
 
-                if disposition == "Missing":
+                if _is_missing(item):
                     sku_log = (item.get("sku") or "").strip()
-                    self.logger.info(f"Item {sku_log} faltante en el return. Saltando.")
+                    self.logger.info(
+                        f"Item {sku_log} con disposition='Missing': no llegó, no se "
+                        f"agrega al return."
+                    )
                     continue
 
                 sku = (item.get("sku") or "").strip()
@@ -680,11 +709,30 @@ class MintsoftReturnService:
         # Items sin put_away_bin: no se pueden mover a ninguna caja. Se saltean
         # para no bloquear a los demas, y al final se lanza para que salga el mail.
         sin_caja: List[str] = []
+        # Items que nunca llegaron (disposition='Missing'): no hay stock que mover.
+        # Se cuentan aparte para no mezclarlos con los que SI deberian tener caja.
+        faltantes: List[str] = []
 
         try:
             for item in line_items:
                 item = item or {}  # un line_item null rompia el loop entero
                 sku = item.get("sku")
+
+                # Missing se chequea PRIMERO: antes del get_product_id y antes del
+                # chequeo de caja. Estos items no traen put_away_bin -- y esta bien
+                # que no lo traigan, porque no hay unidad que guardar -- pero como
+                # `disposition` se leia DESPUES del chequeo de caja, caian en
+                # `sin_caja` y disparaban el mail "Items sin put_away_bin" por lo que
+                # es el comportamiento correcto. Ademas se les gastaba un
+                # get_product_id contra Mintsoft para nada.
+                if _is_missing(item):
+                    self.logger.info(
+                        f"Item {sku} con disposition='Missing': no llego al deposito, "
+                        f"no hay stock que reubicar."
+                    )
+                    faltantes.append(str(sku))
+                    continue
+
                 sku, product_id = self.client.get_product_id(sku, client_id, _get_item_barcode(item))
                 merchant = self._get_merchant_name(data)
                 warehouse = map_warehouse(merchant) # 3 si es Wholesale, 5 si es E-Comm
@@ -847,10 +895,19 @@ class MintsoftReturnService:
                     f"{', '.join(sin_caja)}"
                 )
 
-            if line_items and not responses:
+            if faltantes:
+                self.logger.info(
+                    f"{len(faltantes)} item(s) salteados por estar Missing: "
+                    f"{', '.join(faltantes)}"
+                )
+
+            # Se cuenta sobre los reubicables, no sobre len(line_items): con items
+            # Missing en el payload el mensaje anterior exageraba el faltante.
+            reubicables = len(line_items) - len(faltantes)
+            if reubicables and not responses:
                 self.logger.warning(
-                    f"No se reasigno ningun item de los {len(line_items)} del payload "
-                    f"(ninguno traia put_away_bin): el stock quedo en RET / RET-TEMP"
+                    f"No se reasigno ningun item de los {reubicables} reubicables del "
+                    f"payload (ninguno traia put_away_bin): el stock quedo en RET / RET-TEMP"
                 )
 
             return responses
