@@ -700,16 +700,6 @@ class MintsoftReturnService:
                     sin_caja.append(str(sku))
                     continue
 
-                # Los payloads de RMA pueden traer put_away_bin en null. Sin codigo de
-                # caja no hay destino para el transfer: se saltea el item (queda el stock
-                # en RET / RET-TEMP) en vez de crear una caja basura con Code: None.
-                if not carton_code or not str(carton_code).strip():
-                    self.logger.warning(
-                        f"Item {sku} sin put_away_bin - no se reasigna, "
-                        f"el stock queda en la ubicacion de staging"
-                    )
-                    continue
-
                 disposition = item.get("disposition")
                 if disposition == "Return to Stock": # Stock en buenas condiciones
 
@@ -747,23 +737,30 @@ class MintsoftReturnService:
 
                 else: # Stock a mandar a cuarentena
 
-                    # La cuarentena NO se pide acá: Mintsoft ya la aplicó al confirmar
-                    # el return, porque el motivo que usamos para stock en mal estado
-                    # (ReturnReasonId=2, "Faulty or Damaged - Quarantine Stock") tiene
-                    # StockAction='Quarantine'. Y la aplica CONSERVANDO la location, así
-                    # que la unidad queda en RET-TEMP con Type='Quarantine'.
+                    # El TransferStock de abajo lleva Type='Quarantine', asi que solo
+                    # mueve stock YA cuarentenado. Que la unidad llegue cuarentenada a
+                    # RET-TEMP depende de la rama, y no es igual en las dos:
                     #
-                    # Antes se llamaba además a StockMovement?Action=7, que fallaba
-                    # SIEMPRE con "Unable to Quarantine stock as not enough could be
-                    # found in the selected location!": en esa location ya no queda
-                    # stock normal para cuarentenar, porque la unidad ya está
-                    # cuarentenada. Por eso el comment 'Returned stock sent to
-                    # Quarantine' no aparece en ningún movimiento histórico.
+                    #  - Return INTERNO: add_return_items alloca el item a RET-TEMP y
+                    #    DESPUES confirma, asi que el StockAction='Quarantine' de
+                    #    ReturnReasonId=2 cae sobre la unidad ya ubicada y la deja en
+                    #    RET-TEMP con Type='Quarantine'. Acá el transfer funciona.
                     #
-                    # El TransferStock de abajo sí mueve stock ya cuarentenado (lleva
-                    # Type='Quarantine') y deja la unidad en la caja conservando el
-                    # estado: verificado contra la API, "Successfully transferred 1 of
-                    # 74 from RET-TEMP to TEST-QT-01" -> Type='Quarantine' Carton set.
+                    #  - Return EXTERNO: CreateExternalReturn crea el return YA
+                    #    confirmado, o sea que la cuarentena se aplica ANTES de que el
+                    #    item tenga ubicacion. Recien despues AllocateItemLocation lo
+                    #    deja en RET-TEMP, y lo deja como Type='Allocation'. El segundo
+                    #    confirm_return no re-aplica nada porque ya estaba confirmado.
+                    #    Resultado: no hay stock cuarentenado en RET-TEMP y el transfer
+                    #    falla con "Could not find any of product ID: X in RET-TEMP!".
+                    #
+                    # Verificado con el return de tracking 9434636208303429481960
+                    # (SKU W836-2-Chocolate-6, disposition 'Exception', Bronze Snake):
+                    # quedo en RET-TEMP con Type='Allocation' y sin caja asociada.
+                    #
+                    # Por eso la cuarentena se pide explicitamente y el fallo NO aborta:
+                    # en la rama interna la unidad ya esta cuarentenada y Mintsoft va a
+                    # rechazar el movimiento, y ahi el transfer de abajo funciona igual.
 
                     if warehouse == 3:
                         temporary_location_id = 9    # RET-TEMP Wholesale
@@ -811,10 +808,34 @@ class MintsoftReturnService:
 
                         self.client.create_carton(carton_data, client_id)
 
-                    self.logger.info(
-                        f"{sku}: cuarentena ya aplicada por Mintsoft al confirmar el return "
-                        f"(ReturnReasonId=2). Reubicando a la caja {carton_code}."
-                    )
+                    try:
+                        self.client.quarantine_stock({
+                            # "ProductId", no "ProductID": es la grafia que usan
+                            # TransferStock, AddItem y CreateExternalReturn en toda la
+                            # API. Con "ProductID" el producto no bindeaba y Mintsoft
+                            # contestaba "Unable to Quarantine stock as not enough could
+                            # be found in the selected location!", que se leyo como "ya
+                            # estaba cuarentenado" cuando era un nombre de campo mal
+                            # escrito.
+                            "ProductId": product_id,
+                            "WarehouseId": warehouse,
+                            "LocationId": temporary_location_id,
+                            "Quantity": item.get("quantity"),
+                            "Comment": "Returned stock sent to Quarantine",
+                        })
+                        self.logger.info(
+                            f"{sku}: cuarentenado en RET-TEMP. Reubicando a la caja {carton_code}."
+                        )
+                    except Exception as qt_err:
+                        # No aborta: en la rama interna la unidad ya viene cuarentenada
+                        # por el confirm y este movimiento se rechaza, pero el transfer
+                        # de abajo si funciona. Si el transfer tambien falla, ese si
+                        # lanza y se reporta con el mail de error.
+                        self.logger.warning(
+                            f"{sku}: no se pudo cuarentenar en RET-TEMP ({qt_err}). "
+                            f"Si el return es interno la unidad ya estaba cuarentenada; "
+                            f"se intenta el transfer a {carton_code} igual."
+                        )
 
                     response = self.client.transfer_stock(reallocation_data)
                     responses.append(response)

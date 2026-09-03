@@ -1,5 +1,7 @@
 import os
 import smtplib
+import threading
+import time
 from email.message import EmailMessage
 
 clients = [
@@ -71,9 +73,45 @@ clients = [
 IGNORED_CLIENTS = ["posse"]
 
 
+# --- Throttle de alertas -------------------------------------------------------
+# map_client() manda mail como efecto colateral y se lo llama una vez por POST a
+# /webhook, asi que un emisor que postea en loop (otro event_type, un monitor, un
+# script de retry olvidado) se traducia en un mail por POST. La ventana agrupa los
+# repetidos: se manda el primero y los siguientes se cuentan para informarlos en el
+# proximo. El estado es por proceso: con `--workers 2` puede salir hasta un mail por
+# worker por ventana.
+_ALERT_WINDOW_SECONDS = int(os.environ.get("ALERT_THROTTLE_SECONDS", "1800"))
+_alert_lock = threading.Lock()
+_alert_last_sent = {}  # subject -> (timestamp monotonico, suprimidos desde entonces)
+
+
+def _alert_allowed(subject: str):
+    """Devuelve (mandar?, suprimidos_desde_el_ultimo_envio). Nunca lanza."""
+    now = time.monotonic()
+    with _alert_lock:
+        last, suppressed = _alert_last_sent.get(subject, (None, 0))
+        if last is not None and (now - last) < _ALERT_WINDOW_SECONDS:
+            _alert_last_sent[subject] = (last, suppressed + 1)
+            return False, suppressed + 1
+        _alert_last_sent[subject] = (now, 0)
+        return True, suppressed
+
+
 def _send_alert_email(subject: str, body: str) -> None:
     """Manda un mail de alerta. Nunca lanza: un fallo de notificación no debe
     romper al caller."""
+    allowed, suppressed = _alert_allowed(subject)
+    if not allowed:
+        print(
+            f"[alerta suprimida] repetida {suppressed}x en los ultimos "
+            f"{_ALERT_WINDOW_SECONDS}s: {subject}"
+        )
+        return
+    if suppressed:
+        body = (
+            f"{body}\n\n---\nSe suprimieron {suppressed} alertas identicas en los "
+            f"ultimos {_ALERT_WINDOW_SECONDS} segundos (throttle por proceso)."
+        )
     try:
         smtp_host = os.environ.get("SMTP_HOST")
         smtp_port = int(os.environ.get("SMTP_PORT", "587"))

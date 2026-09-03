@@ -66,10 +66,22 @@ def enviar_webhook_por_sku(datos):
 
 
 def enviar_a_google_async(datos):
-    """Función para enviar datos en segundo plano"""
+    """Archiva el payload crudo en la planilla de Google Apps Script.
+
+    Antes esto era un `session.post(...)` sin mirar la respuesta y un print de
+    exito incondicional. Como el `Retry` esta con `raise_on_status=False`, un
+    500 / 403 de Apps Script -- o un GAS_URL sin setear -- se logueaba igual
+    como "enviado correctamente" y no se subia nada. Una planilla vacia
+    parecia entonces "no llego ningun webhook", que es la conclusion
+    exactamente opuesta a la verdadera.
+    """
+    if not GAS_URL:
+        print("❌ GAS_URL no esta seteada: el payload NO se archiva")
+        return
     try:
-        session.post(GAS_URL, json=datos, timeout=120)
-        print("✅ Enviado a Google Apps Script correctamente")
+        response = session.post(GAS_URL, json=datos, timeout=120, allow_redirects=True)
+        response.raise_for_status()
+        print(f"✅ Payload archivado en Google Apps Script (HTTP {response.status_code})")
     except Exception as e:
         print(f"❌ Error enviando a Google: {e}")
 
@@ -143,6 +155,30 @@ def webhook():
 
     thread_data = raw_data.copy() if isinstance(raw_data, dict) else raw_data
 
+    # Quien postea y que postea. Es la unica fuente de verdad que queda cuando
+    # el archivado a GAS falla, y es lo que permite distinguir "Two Boxes manda
+    # otro event_type" de "un monitor / un script de retry esta posteando".
+    event_type = event_id = n_items = merchant = None
+    if isinstance(raw_data, dict):
+        event_type = raw_data.get("event_type")
+        event_id = raw_data.get("id")
+        event_data = raw_data.get("event_data")
+        if isinstance(event_data, dict):
+            line_items = event_data.get("line_items")
+            n_items = len(line_items) if isinstance(line_items, list) else None
+            try:
+                # Solo para el log. Va en try porque este codigo corre DENTRO del
+                # handler: una excepcion aca convertiria el 200 en un 500 y haria
+                # que Two Boxes reintente, que es justo lo que no queremos.
+                merchant = return_service._get_merchant_name(raw_data) or None
+            except Exception as e:
+                merchant = f"<error resolviendo merchant: {e}>"
+    print(
+        f"📥 POST /webhook event_type={event_type!r} id={event_id!r} "
+        f"line_items={n_items} merchant={merchant!r} "
+        f"remote_addr={request.remote_addr} "
+        f"user_agent={request.headers.get('User-Agent')!r}"
+    )
     print("tdata", thread_data)
 
     # Todo se despacha en segundo plano: el handler tiene que devolver 200 en
