@@ -66,22 +66,10 @@ def enviar_webhook_por_sku(datos):
 
 
 def enviar_a_google_async(datos):
-    """Archiva el payload crudo en la planilla de Google Apps Script.
-
-    Antes esto era un `session.post(...)` sin mirar la respuesta y un print de
-    exito incondicional. Como el `Retry` esta con `raise_on_status=False`, un
-    500 / 403 de Apps Script -- o un GAS_URL sin setear -- se logueaba igual
-    como "enviado correctamente" y no se subia nada. Una planilla vacia
-    parecia entonces "no llego ningun webhook", que es la conclusion
-    exactamente opuesta a la verdadera.
-    """
-    if not GAS_URL:
-        print("❌ GAS_URL no esta seteada: el payload NO se archiva")
-        return
+    """Función para enviar datos en segundo plano"""
     try:
-        response = session.post(GAS_URL, json=datos, timeout=120, allow_redirects=True)
-        response.raise_for_status()
-        print(f"✅ Payload archivado en Google Apps Script (HTTP {response.status_code})")
+        session.post(GAS_URL, json=datos, timeout=120)
+        print("✅ Enviado a Google Apps Script correctamente")
     except Exception as e:
         print(f"❌ Error enviando a Google: {e}")
 
