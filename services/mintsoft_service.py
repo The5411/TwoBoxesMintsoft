@@ -2,11 +2,12 @@ import os
 import json
 import sys
 import socket
+import threading
 import smtplib
 import traceback
 from email.message import EmailMessage
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -86,8 +87,147 @@ class MintsoftReturnService:
         self.smtp_port = int(os.environ.get("SMTP_PORT", "587"))
         self.smtp_user = os.environ.get("SMTP_USER")
         self.smtp_password = os.environ.get("SMTP_PASSWORD")
-        self.alert_email_to = "bgallo@the5411.com, jcordero@the5411.com, ngurfinkel@the5411.com, mbivort@the5411.com",
+        # Sin la coma final: con ella esto era una TUPLA de un elemento, no un
+        # string. Y se lee de ALERT_EMAIL_TO para no tener dos listas hardcodeadas
+        # en dos archivos distintos (la otra esta en mappers/mintsoft_mapper.py).
+        self.alert_email_to = os.environ.get(
+            "ALERT_EMAIL_TO",
+            "bgallo@the5411.com, jcordero@the5411.com, ngurfinkel@the5411.com, mbivort@the5411.com",
+        )
         self.alert_email_from = os.environ.get("ALERT_EMAIL_FROM", self.smtp_user or "")
+
+        # Reporte de problemas del webhook que se esta procesando. Es thread-local
+        # porque el service es una instancia unica compartida por los 10 threads del
+        # executor del listener, pero procesar_webhook y todo lo que llama corren en
+        # el MISMO thread, asi que cada webhook ve solo sus propios problemas.
+        self._reporte = threading.local()
+
+    # -------------------------------------------------------------
+    # Un webhook = un mail. Antes cada capa mandaba el suyo: un return externo
+    # que fallaba generaba el de allocate_external_return_items MAS el del
+    # catch-all de listener.procesar_webhook, y uno interno podia llegar a tres
+    # o cuatro (add_return_items por items caidos, add_return_items por la
+    # excepcion, reallocate_return_items, y el catch-all). Ahora los problemas se
+    # acumulan durante el procesamiento y se manda uno solo al final.
+    # -------------------------------------------------------------
+    def begin_webhook_report(self, data) -> None:
+        """Abre el reporte del webhook. Idempotente si ya hay uno abierto."""
+        self._reporte.problemas = []
+        try:
+            self._reporte.referencia = self._return_identifier(data)
+        except Exception:
+            self._reporte.referencia = None
+        try:
+            event_data = (data or {}).get("event_data") or {}
+            self._reporte.event_type = (data or {}).get("event_type")
+            self._reporte.merchant = self._get_merchant_name(data) or None
+            line_items = event_data.get("line_items")
+            self._reporte.total_items = (
+                len(line_items) if isinstance(line_items, list) else None
+            )
+        except Exception:
+            self._reporte.event_type = None
+            self._reporte.merchant = None
+            self._reporte.total_items = None
+
+    def _reporte_activo(self) -> bool:
+        return isinstance(getattr(self._reporte, "problemas", None), list)
+
+    def flush_webhook_report(self) -> None:
+        """Manda UN mail con todos los problemas del webhook, y cierra el reporte."""
+        problemas = getattr(self._reporte, "problemas", None)
+        self._reporte.problemas = None
+        if not problemas:
+            return
+        try:
+            self._enviar_reporte(problemas)
+        except Exception as e:
+            self.logger.error(f"No se pudo enviar el reporte del webhook: {e}", exc_info=True)
+
+    def _enviar_reporte(self, problemas: List[Dict[str, Any]]) -> None:
+        ref = getattr(self._reporte, "referencia", None) or "UNKNOWN"
+        merchant = getattr(self._reporte, "merchant", None) or "?"
+        event_type = getattr(self._reporte, "event_type", None) or "?"
+        total_items = getattr(self._reporte, "total_items", None)
+
+        if not (self.smtp_host and self.smtp_user and self.smtp_password and self.alert_email_to):
+            self.logger.warning(
+                f"Reporte NO enviado (faltan credenciales SMTP). "
+                f"{len(problemas)} problema(s) en POReference={ref}."
+            )
+            return
+
+        # El asunto dice QUE falta, no solo donde fallo: es lo que se lee primero.
+        titulares = []
+        for pr in problemas:
+            if pr.get("que_falta"):
+                titulares.append(pr["que_falta"])
+        resumen = titulares[0] if titulares else problemas[0].get("paso", "error")
+        if len(problemas) > 1:
+            resumen = f"{resumen} (+{len(problemas) - 1} mas)"
+        subject = f"[Mintsoft] {merchant} - {resumen} - PO {ref}"
+
+        lineas = [
+            f"Return {ref} de {merchant} -- {len(problemas)} problema(s) sin resolver.",
+            "",
+            f"POReference:  {ref}",
+            f"Merchant:     {merchant}",
+            f"event_type:   {event_type}",
+            f"Items:        {total_items if total_items is not None else '?'}",
+            f"Hora (UTC):   {datetime.now(timezone.utc).isoformat()}Z",
+            f"Host:         {socket.gethostname()}",
+            "",
+            "=" * 70,
+        ]
+
+        for n, pr in enumerate(problemas, 1):
+            lineas.append("")
+            lineas.append(f"[{n}/{len(problemas)}] {pr.get('que_falta') or pr.get('paso')}")
+            if pr.get("sku"):
+                lineas.append(f"    SKU:          {pr['sku']}")
+            lineas.append(f"    Paso:         {pr.get('paso')}")
+            if pr.get("accion"):
+                lineas.append(f"    Que hacer:    {pr['accion']}")
+            lineas.append(f"    Error:        {pr.get('error_tipo')}: {pr.get('error_msg')}")
+            if pr.get("context"):
+                try:
+                    ctx = json.dumps(pr["context"], indent=6, default=str)
+                except Exception:
+                    ctx = str(pr["context"])
+                lineas.append(f"    Contexto:     {ctx}")
+
+        # Los tracebacks al final y una sola vez: son lo mas largo y lo que menos
+        # se necesita para arreglar el return a mano.
+        vistos = set()
+        tbs = []
+        for pr in problemas:
+            tb = pr.get("traceback")
+            if tb and tb not in vistos:
+                vistos.add(tb)
+                tbs.append(f"--- {pr.get('paso')} ---\n{tb}")
+        if tbs:
+            lineas += ["", "=" * 70, "", "Tracebacks:", ""] + tbs
+
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = self.alert_email_from
+        msg["To"] = self.alert_email_to
+        msg.set_content("\n".join(lineas))
+
+        with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=15) as server:
+            server.ehlo()
+            try:
+                server.starttls()
+                server.ehlo()
+            except Exception:
+                pass
+            server.login(self.smtp_user, self.smtp_password)
+            server.send_message(msg)
+
+        self.logger.info(
+            f"Reporte enviado a {self.alert_email_to}: {len(problemas)} problema(s), "
+            f"POReference={ref}"
+        )
 
     # -------------------------------------------------------------
     # Internal: send an error notification email. Never raises.
@@ -100,7 +240,54 @@ class MintsoftReturnService:
         error: BaseException,
         order_reference: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
+        sku: Optional[str] = None,
+        que_falta: Optional[str] = None,
+        accion: Optional[str] = None,
     ) -> None:
+        """Reporta un problema. Si hay un reporte de webhook abierto, lo acumula
+        para que salga UN solo mail al final; si no, manda el mail suelto.
+
+        `que_falta` y `accion` son lo importante: describen en una linea que quedo
+        sin hacer y que hay que corregir a mano. El tipo de excepcion y el
+        traceback dicen donde se rompio el codigo, no que le falta al return.
+        """
+        if self._reporte_activo():
+            error_msg = str(error)
+            # Dedupe: allocate_external_return_items y reallocate_return_items
+            # reportan y ademas re-lanzan, asi que el catch-all del listener ve la
+            # MISMA excepcion. Sin esto, cada fallo entraba dos veces al reporte.
+            for previo in self._reporte.problemas:
+                if previo.get("error_msg") == error_msg and previo.get("sku") == sku:
+                    # Si el segundo reporte trae mejor descripcion, se queda con esa.
+                    if que_falta and not previo.get("que_falta"):
+                        previo["que_falta"] = que_falta
+                    if accion and not previo.get("accion"):
+                        previo["accion"] = accion
+                    return
+            try:
+                tb = "".join(
+                    traceback.format_exception(type(error), error, error.__traceback__)
+                )
+            except Exception:
+                tb = None
+            self._reporte.problemas.append({
+                "paso": method,
+                "sku": sku,
+                "que_falta": que_falta,
+                "accion": accion,
+                "error_tipo": type(error).__name__,
+                "error_msg": error_msg,
+                "context": context,
+                "traceback": tb,
+            })
+            if order_reference and not getattr(self._reporte, "referencia", None):
+                self._reporte.referencia = order_reference
+            self.logger.error(
+                f"[reporte] {method}: {que_falta or error_msg}"
+                + (f" (SKU {sku})" if sku else "")
+            )
+            return
+
         try:
             if not (self.smtp_host and self.smtp_user and self.smtp_password and self.alert_email_to):
                 self.logger.warning(
@@ -110,7 +297,7 @@ class MintsoftReturnService:
                 return
 
             host = socket.gethostname()
-            ts = datetime.utcnow().isoformat() + "Z"
+            ts = datetime.now(timezone.utc).isoformat() + "Z"
             tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
 
             ref_label = str(order_reference) if order_reference else "UNKNOWN"
@@ -159,6 +346,124 @@ class MintsoftReturnService:
         except Exception as mail_err:
             # Never let notification failures take down the caller.
             self.logger.error(f"Failed to send error alert email: {mail_err}", exc_info=True)
+
+    # Mintsoft usa este texto cuando no encuentra stock movible en el origen. Es el
+    # UNICO error de TransferStock que se reintenta, y se puede reintentar porque
+    # significa que el transfer no se ejecuto: no hay riesgo de mover dos veces.
+    _TRANSFER_NOT_FOUND = "could not find any of product"
+    _TRANSFER_INTENTOS = 3
+    _TRANSFER_ESPERA_BASE = 2  # segundos; backoff 2s, 4s -> 6s como maximo por item
+
+    def _stock_en_caja(self, warehouse_id, client_id, sku, carton_code, stock_cache):
+        """(cantidad, [tipos]) del SKU dentro de la caja, o (None, None) si no se sabe.
+
+        El reporte se baja UNA vez por llamada a reallocate_return_items y se cachea
+        en `stock_cache`: antes se consultaba por item, y con un return de varios
+        items eso eran varias descargas de un reporte de miles de filas.
+        """
+        key = (warehouse_id, client_id)
+        if key not in stock_cache:
+            stock_cache[key] = self.client.fetch_products_in_locations(
+                warehouse_id, client_id
+            )
+        rows = stock_cache[key]
+        if rows is None:
+            return None, None
+
+        sku_b = str(sku or "").strip().upper()
+        caja_b = str(carton_code or "").strip().upper()
+        cantidad, tipos = 0, []
+        for x in rows:
+            if str(x.get("ProductSKU") or "").strip().upper() != sku_b:
+                continue
+            if str(x.get("CartonCode") or "").strip().upper() != caja_b:
+                continue
+            try:
+                cantidad += int(x.get("Quantity") or 0)
+            except (TypeError, ValueError):
+                pass
+            tipo = str(x.get("Type") or "").strip()
+            if tipo and tipo not in tipos:
+                tipos.append(tipo)
+        return cantidad, tipos
+
+    def _transfer_stock_resiliente(self, reallocation_data, sku, client_id, stock_cache):
+        """TransferStock con reintentos acotados y tolerancia al no-op.
+
+        Mintsoft rechaza el transfer con "Could not find any of product ID: X in
+        <origen>!" en dos situaciones que no son lo mismo:
+
+          1. El stock todavia no aterrizo en el origen. Es transitorio: el confirm
+             del return puede tardar en reflejarse. Aca reintentar SI sirve, y por
+             eso hay un backoff corto en vez de un time.sleep fijo antes de cada
+             transfer -- el sleep se paga solo cuando hace falta, no siempre.
+
+          2. La unidad ya esta DENTRO de la caja destino. Pasa cuando la caja vive
+             en la misma location que el origen (BS-DAMAGED-50 esta en RET-TEMP):
+             ahi el confirm consolida la unidad adentro de la caja y no queda nada
+             suelto para mover. Reintentar no sirve, va a fallar siempre. Pero el
+             stock YA esta en el put_away_bin, que es el destino que queriamos: el
+             transfer era un no-op.
+
+        Se reintenta SOLO con ese mensaje. Cualquier otro error -- un ReadTimeout
+        incluido -- se relanza de una: si el request se corto sin respuesta no se
+        sabe si Mintsoft lo aplico, y reintentar a ciegas podria mover dos veces.
+        """
+        ultimo = None
+        for intento in range(1, self._TRANSFER_INTENTOS + 1):
+            try:
+                return self.client.transfer_stock(reallocation_data)
+            except Exception as e:
+                if self._TRANSFER_NOT_FOUND not in str(e).lower():
+                    raise
+                ultimo = e
+                if intento < self._TRANSFER_INTENTOS:
+                    espera = self._TRANSFER_ESPERA_BASE * intento
+                    self.logger.warning(
+                        f"{sku}: TransferStock no encontro stock en "
+                        f"{reallocation_data.get('SourceNameOrCode')!r} "
+                        f"(intento {intento}/{self._TRANSFER_INTENTOS}). "
+                        f"Reintentando en {espera}s."
+                    )
+                    time.sleep(espera)
+
+        # Agotados los reintentos: ver si en realidad ya esta en el destino.
+        carton_code = reallocation_data.get("DestinationNameOrCode")
+        cantidad, tipos = self._stock_en_caja(
+            reallocation_data.get("DestinationWarehouseId"),
+            client_id, sku, carton_code, stock_cache,
+        )
+
+        if cantidad is None:
+            self.logger.error(
+                f"{sku}: TransferStock fallo y NO se pudo verificar si el stock ya "
+                f"esta en {carton_code!r}. Se reporta el error original."
+            )
+            raise ultimo
+        if cantidad <= 0:
+            self.logger.error(
+                f"{sku}: TransferStock fallo y el stock tampoco esta en "
+                f"{carton_code!r}. Es un faltante real."
+            )
+            raise ultimo
+
+        self.logger.info(
+            f"{sku}: no habia stock suelto en "
+            f"{reallocation_data.get('SourceNameOrCode')!r}, pero ya hay {cantidad} "
+            f"unidad(es) dentro de {carton_code!r} (Type={tipos}). El confirm las "
+            f"consolido en la caja: el stock ya esta en su destino y el transfer "
+            f"era un no-op."
+        )
+        if not any(t.strip().upper() == "QUARANTINE" for t in (tipos or [])):
+            self.logger.warning(
+                f"{sku}: las {cantidad} unidad(es) en {carton_code!r} NO estan en "
+                f"cuarentena (Type={tipos}). Hay que cuarentenarlas a mano."
+            )
+        return {
+            "Success": True,
+            "Message": f"No-op: el stock ya estaba en {carton_code}",
+            "NoOp": True,
+        }
 
     def _get_merchant_name(self, data) -> str:
         """Nombre del merchant, buscándolo en los tres lugares donde puede venir.
@@ -357,6 +662,13 @@ class MintsoftReturnService:
                 line_items = event_data.get("line_items", [])
                 return_identifier = self._return_identifier(data)
 
+                if len(return_identifier) > 50:
+                    # Mintsoft corta la Reference en 50: si se trunca, el PO reference
+                    # que se busca despues no es el que se ve en el mail.
+                    self.logger.warning(
+                        f"Reference truncada a 50 caracteres: "
+                        f"{return_identifier!r} -> {return_identifier[:50]!r}"
+                    )
                 external_return_data = {
                     "Reference": return_identifier[:50],
                     "ClientId": client_id,
@@ -399,6 +711,17 @@ class MintsoftReturnService:
                         # Usamos el ID del item recien creado
                         product_id = created_product_id
 
+                        if product_id is None:
+                            # Mintsoft rechaza el CreateExternalReturn entero si un
+                            # item viene con ProductId null, pero el mensaje que
+                            # devuelve no dice cual fue. Fallar aca nombra el SKU:
+                            # mismo resultado (no se crea el return), diagnostico util.
+                            raise RuntimeError(
+                                f"No se pudo crear el producto {sku!r} en Mintsoft, "
+                                f"asi que el item no tiene ProductId. El return no se "
+                                f"crea: hay que dar de alta el SKU a mano."
+                            )
+
                         # Sleep de 3 segundos para no saturar la API
                         time.sleep(3)
                         
@@ -434,7 +757,13 @@ class MintsoftReturnService:
 
                     external_return_data["ReturnItems"].append(return_item_data)
 
-                print(external_return_data)
+                # Sin volcar el payload: trae SKUs y el tracking. El resumen
+                # alcanza para saber que se mando.
+                self.logger.info(
+                    f"CreateExternalReturn: ClientId={client_id} WarehouseId={warehouse} "
+                    f"items={len(external_return_data['ReturnItems'])} "
+                    f"Reference={external_return_data['Reference']!r}"
+                )
                 external_return_id = self.client.create_external_return(data=external_return_data)
 
                 self.logger.info(f"External return created. ID: {external_return_id}")
@@ -471,6 +800,11 @@ class MintsoftReturnService:
                 method="create_return",
                 error=e,
                 order_reference=self._return_identifier(data),
+                que_falta="El return NO se creo en Mintsoft",
+                accion=(
+                    "Crear el return a mano en Mintsoft y ubicar los items: el stock "
+                    "devuelto no quedo registrado en ninguna parte."
+                ),
                 context={
                     "merchant_name": merchant_name,
                     "client_id": client_id,
@@ -481,10 +815,15 @@ class MintsoftReturnService:
             return None, "No Return Created"
 
     def allocate_external_return_items(self, data, return_id: int):
-        merchant_name = self._get_merchant_name(data)
-        warehouse = map_warehouse(merchant_name)
+        # La EXTRACCION del payload va dentro del try: si el evento tiene una forma
+        # inesperada, antes lanzaba aca afuera y se salteaba el handler, asi que no
+        # se reportaba nada y el error escapaba al catch-all del listener.
+        merchant_name = None
+        warehouse = None
 
         try:
+            merchant_name = self._get_merchant_name(data)
+            warehouse = map_warehouse(merchant_name)
             return_details = self.client.get_return_details(return_id)
             return_items = return_details.get('ReturnItems')
 
@@ -503,13 +842,16 @@ class MintsoftReturnService:
                     else:
                         location_id = 4304 # RET-TEMP E-Commerce
 
-                data = {
+                # Ojo con el nombre: esto se llamaba `data` y pisaba el parametro con
+                # el payload del webhook, asi que el handler de abajo no podia sacar la
+                # referencia y TODOS estos mails salian con "POReference: UNKNOWN".
+                allocation_data = {
                     'ReturnItemId': item.get('ID'),
                     'Quantity': item.get('Quantity'),
                     'LocationId': location_id
                 }
 
-                response = self.client.allocate_return_item_location(return_id, data)
+                response = self.client.allocate_return_item_location(return_id, allocation_data)
                 self.logger.info(f"Allocated External Return Items to {location_id}: {response}")
 
 
@@ -520,15 +862,19 @@ class MintsoftReturnService:
 
         except Exception as e:
             self.logger.error(f"Error allocating external return items for return {return_id}: {e}", exc_info=True)
-            # `data` may have been overwritten in the loop above, so try to pull a
-            # reference from it only if it still looks like the original payload.
-            ref = None
-            if isinstance(data, dict) and "event_data" in data:
-                ref = self._safe_get_storefront_order_number(data)
             self._send_error_email(
                 method="allocate_external_return_items",
                 error=e,
-                order_reference=ref,
+                order_reference=self._return_identifier(data),
+                que_falta=(
+                    f"El return externo {return_id} quedo con items sin ubicar y SIN "
+                    f"confirmar"
+                ),
+                accion=(
+                    f"Abrir el return {return_id} en Mintsoft, ubicar los items que "
+                    f"falten en RET / RET-TEMP y confirmarlo. El loop corta en el primer "
+                    f"item que falla, asi que los siguientes tampoco se ubicaron."
+                ),
                 context={
                     "merchant_name": merchant_name,
                     "warehouse": warehouse,
@@ -675,6 +1021,16 @@ class MintsoftReturnService:
                         f"{len(items_to_allocate)} de {len(line_items)} items"
                     ),
                     order_reference=self._return_identifier(data),
+                    sku=", ".join(str(d.get("sku")) for d in dropped_items),
+                    que_falta=(
+                        f"Faltan {len(dropped_items)} de {len(line_items)} items en el "
+                        f"return {return_id}, que quedo confirmado y corto"
+                    ),
+                    accion=(
+                        f"Agregar a mano al return {return_id}: {detalle}. Ya esta "
+                        f"confirmado, asi que hay menos unidades registradas de las que "
+                        f"devolvio el cliente."
+                    ),
                     context={
                         "return_id": return_id,
                         "items_agregados": len(items_to_allocate),
@@ -692,14 +1048,20 @@ class MintsoftReturnService:
                 error=e,
                 order_reference=self._return_identifier(data),
                 context={"return_id": return_id},
+                que_falta=f"El return interno {return_id} quedo sin items y SIN confirmar",
+                accion=(
+                    f"Abrir el return {return_id} en Mintsoft, agregar los items, "
+                    f"ubicarlos en RET / RET-TEMP y confirmarlo."
+                ),
             )
             return None
     
     def reallocate_return_items(self, data):
-        merchant_name = self._get_merchant_name(data)
-        client_id = map_client(merchant_name) # Si no encuentra devuelve None
-        event_data = data.get("event_data") or {}
-        line_items = event_data.get("line_items", [])
+        # Igual que en allocate_external_return_items: la extraccion del payload va
+        # adentro del try, para que una forma inesperada se reporte y no escape.
+        merchant_name = None
+        client_id = None
+        line_items: List[Any] = []
 
         # Se acumula un resultado por item reasignado. Hay que inicializarla acá:
         # responses.append() y `return responses` se usaban sin que la lista
@@ -712,8 +1074,14 @@ class MintsoftReturnService:
         # Items que nunca llegaron (disposition='Missing'): no hay stock que mover.
         # Se cuentan aparte para no mezclarlos con los que SI deberian tener caja.
         faltantes: List[str] = []
+        # El reporte de stock se baja una sola vez por llamada, no por item.
+        stock_cache: Dict[Any, Any] = {}
 
         try:
+            merchant_name = self._get_merchant_name(data)
+            client_id = map_client(merchant_name)  # Si no encuentra devuelve None
+            event_data = data.get("event_data") or {}
+            line_items = event_data.get("line_items", []) or []
             for item in line_items:
                 item = item or {}  # un line_item null rompia el loop entero
                 sku = item.get("sku")
@@ -779,7 +1147,9 @@ class MintsoftReturnService:
 
                         self.client.create_carton(carton_data, client_id)
 
-                    response = self.client.transfer_stock(reallocation_data)
+                    response = self._transfer_stock_resiliente(
+                        reallocation_data, sku, client_id, stock_cache
+                    )
                     responses.append(response)
                     print(response)
 
@@ -870,7 +1240,7 @@ class MintsoftReturnService:
                             "LocationId": temporary_location_id,
                             "Quantity": item.get("quantity"),
                             "Comment": "Returned stock sent to Quarantine",
-                        })
+                        }, timeout=25)
                         self.logger.info(
                             f"{sku}: cuarentenado en RET-TEMP. Reubicando a la caja {carton_code}."
                         )
@@ -885,7 +1255,9 @@ class MintsoftReturnService:
                             f"se intenta el transfer a {carton_code} igual."
                         )
 
-                    response = self.client.transfer_stock(reallocation_data)
+                    response = self._transfer_stock_resiliente(
+                        reallocation_data, sku, client_id, stock_cache
+                    )
                     responses.append(response)
                     print(response)
 
@@ -921,6 +1293,22 @@ class MintsoftReturnService:
                 method="reallocate_return_items",
                 error=e,
                 order_reference=self._return_identifier(data),
+                sku=", ".join(sin_caja) if sin_caja else None,
+                que_falta=(
+                    f"{len(sin_caja)} item(s) sin put_away_bin: el stock quedo en "
+                    f"RET / RET-TEMP y no se movio a ninguna caja"
+                    if sin_caja else
+                    "El stock quedo en RET / RET-TEMP, sin mover a la caja del operario"
+                ),
+                accion=(
+                    f"Mover a mano el stock de {', '.join(sin_caja)} desde RET / RET-TEMP "
+                    f"a la caja fisica que corresponda. El return SI esta creado y "
+                    f"confirmado; lo que falta es el movimiento de stock."
+                    if sin_caja else
+                    "Mover a mano el stock desde RET / RET-TEMP a la caja del "
+                    "put_away_bin. El return SI esta creado y confirmado; lo que falta "
+                    "es el movimiento de stock."
+                ),
                 context={
                     "merchant_name": merchant_name,
                     "client_id": client_id,

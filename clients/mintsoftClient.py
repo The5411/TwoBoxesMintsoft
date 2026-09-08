@@ -161,9 +161,10 @@ class MintsoftOrderClient:
         url = f"{self.BASE_URL}/api/Return/CreateExternalReturn"
 
         r = requests.post(
-            url, 
+            url,
             headers=self.headers(),
-            json=data
+            json=data,
+            timeout=120,
         )
 
         response = self._toolkit_result(r, "Return/CreateExternalReturn")
@@ -260,7 +261,7 @@ class MintsoftOrderClient:
             )
         return response
 
-    def quarantine_stock(self, request):
+    def quarantine_stock(self, request, timeout: int = 120):
         """Manda stock a cuarentena (StockMovement Action=7). Lanza si falla.
 
         NO usar en el flujo de returns: Mintsoft ya cuarentena al confirmar, por el
@@ -275,7 +276,7 @@ class MintsoftOrderClient:
             url=url,
             headers=self.headers(),
             json=request,
-            timeout=120
+            timeout=timeout
         )
 
         response = self._toolkit_result(r, "Warehouse/StockMovement?Action=7")
@@ -320,6 +321,67 @@ class MintsoftOrderClient:
             json.dump(data, f, ensure_ascii=False, indent=4)
         return data
     
+    def fetch_products_in_locations(self, warehouse_id: int, client_id: int,
+                                    timeout: int = 30, max_pages: int = 10):
+        """Filas del ProductsInLocationReport, o None si no se pudo leer completo.
+
+        None significa "no se sabe", y es distinto de una lista vacia: el caller
+        usa esto para decidir si un TransferStock fallido es en realidad un no-op,
+        y ahi "no se pudo consultar" NO puede pasar por "el stock no esta".
+
+        Pagina con PageNo/Limit igual que Order/List: el reporte corta en 1000
+        filas por pagina y sin paginar queda truncado en silencio. Se corta si una
+        pagina viene incompleta, vacia, o identica a la anterior -- esto ultimo por
+        si la API ignora PageNo, como ya paso con statusId en Order/List.
+
+        `timeout` es 30 y no 120 a proposito: es un reporte pesado que se consulta
+        SOLO en el camino de error, y no puede quedarse con un thread del pool del
+        listener mas de lo necesario.
+        """
+        url = f"{self.BASE_URL}/api/Reports/ProductsInLocationReport"
+        limit = 1000
+        todas: List[Dict[str, Any]] = []
+        huella_previa = None
+
+        try:
+            for page_no in range(1, max_pages + 1):
+                r = requests.get(
+                    url,
+                    headers=self.headers(),
+                    params={
+                        "warehouseId": warehouse_id,
+                        "clientId": client_id,
+                        "PageNo": page_no,
+                        "Limit": limit,
+                    },
+                    timeout=timeout,
+                )
+                r.raise_for_status()
+                rows = r.json()
+                if isinstance(rows, dict):
+                    rows = rows.get("Results") or rows.get("Data") or []
+                if not rows:
+                    break
+
+                huella = tuple(
+                    (x.get("ProductSKU"), x.get("Location"), x.get("CartonCode"),
+                     x.get("Quantity"))
+                    for x in rows[:50]
+                )
+                if huella == huella_previa:
+                    return None  # la API ignora PageNo: quedaria truncado
+                huella_previa = huella
+
+                todas.extend(rows)
+                if len(rows) < limit:
+                    break
+            else:
+                return None  # se agoto el tope de paginas
+        except Exception:
+            return None
+
+        return todas
+
     def get_return_reasons(self):
         url = f"{self.BASE_URL}/api/Return/Reasons"
 
@@ -369,11 +431,15 @@ class MintsoftOrderClient:
     
     
     def get_product_id(self, sku: str, client_id: int, barcode):
-        url = f"{self.BASE_URL}//api/Product/Search?Search={sku}"
+        # params= en vez de interpolar, y sin el doble slash: hay SKUs y nombres
+        # con & y espacios (la tabla de clientes tiene 'staple & hue'), que rompen
+        # el querystring. La forma correcta ya la usan search_orders y check_carton.
+        url = f"{self.BASE_URL}/api/Product/Search"
 
         r = requests.get(
             url,
             headers=self.headers(),
+            params={"Search": sku},
             timeout=120,
         )
 
@@ -398,17 +464,17 @@ class MintsoftOrderClient:
             if sku_rety == "null":
                 return sku, None
 
-            url = f"{self.BASE_URL}//api/Product/Search?Search={sku_rety}"
+            url = f"{self.BASE_URL}/api/Product/Search"
 
             r = requests.get(
                 url,
                 headers=self.headers(),
+                params={"Search": sku_rety},
                 timeout=120,
             )
 
             r.raise_for_status()
             data = r.json()
-            print(data, "barcode buscado")
             try: 
                 product_id = data[0]["ID"]
                 print(product_id, "producto change")
@@ -481,7 +547,7 @@ class MintsoftOrderClient:
     def create_product(self, product_data):
         url = f'{self.BASE_URL}/api/Product'
 
-        r = requests.put(url, json = product_data, headers = self.headers())
+        r = requests.put(url, json=product_data, headers=self.headers(), timeout=120)
 
         if r.status_code == 200:
             body = r.json()

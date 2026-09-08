@@ -73,6 +73,33 @@ def enviar_a_google_async(datos):
     except Exception as e:
         print(f"❌ Error enviando a Google: {e}")
 
+PII_KEYS = ("customer", "rma_address")
+
+
+def _redactar_pii(datos):
+    """Copia del payload sin los campos con datos personales del comprador.
+
+    Se saca customer (nombre, mail) y rma_address (domicilio). Se deja el resto,
+    tracking_number incluido: es el PO reference con el que se busca el return en
+    Mintsoft, asi que sin el los logs no sirven para operar.
+    """
+    try:
+        if not isinstance(datos, dict):
+            return datos
+        copia = dict(datos)
+        event_data = copia.get("event_data")
+        if isinstance(event_data, dict):
+            event_data = dict(event_data)
+            for k in PII_KEYS:
+                if k in event_data:
+                    event_data[k] = "<redactado>"
+            copia["event_data"] = event_data
+        return copia
+    except Exception:
+        # Nunca romper el handler por el logging.
+        return "<no se pudo redactar el payload>"
+
+
 def _identificar_return(data):
     """Misma lógica de identificación que usa MintsoftReturnService para los mails
     de error: tracking_number si existe, si no completed_at-email del cliente."""
@@ -91,6 +118,9 @@ def _identificar_return(data):
 
 
 def procesar_webhook(data):
+    # Un webhook = un mail. El reporte junta los problemas de todas las capas y se
+    # manda una sola vez en el finally, en vez de un mail por capa que fallaba.
+    return_service.begin_webhook_report(data)
     try:
         # Crea return interno o externo
         return_id = return_service.create_return(data)
@@ -112,7 +142,13 @@ def procesar_webhook(data):
           # Pasar items de RET o RET-QT a la caja del return si es Internal
           return_service.reallocate_return_items(data)
 
-        print("Webhook procesado con exito")
+        # No afirmar exito cuando no se creo nada: "Webhook procesado con exito"
+        # se imprimia igual con (None, "No Return Created"), que es justo el caso
+        # que hay que revisar.
+        if return_id and return_id[1] == "No Return Created":
+            print(f"⚠️ Webhook NO produjo return en Mintsoft ({return_id[1]})")
+        else:
+            print("Webhook procesado con exito")
 
     except Exception as e:
         # Catch-all: cualquier fallo que no haya sido capturado (y notificado) dentro
@@ -121,14 +157,28 @@ def procesar_webhook(data):
         print(f"Error procesando webhook: {e}")
         traceback.print_exc()
         try:
+            # Si la capa de abajo ya reporto esta misma excepcion, el reporte la
+            # deduplica y esto no agrega nada. Queda para los fallos que no paso
+            # ninguna capa (por ejemplo un payload con una forma inesperada).
             return_service._send_error_email(
                 method="procesar_webhook",
                 error=e,
                 order_reference=_identificar_return(data),
                 context={"origen": "listener.procesar_webhook"},
+                que_falta="El webhook no se pudo procesar",
+                accion=(
+                    "Revisar el payload y reprocesarlo. Ojo: reprocesar crea un return "
+                    "nuevo en Mintsoft, no actualiza el anterior (no hay idempotencia)."
+                ),
             )
         except Exception as mail_err:
-            print(f"❌ No se pudo enviar el mail de error: {mail_err}")
+            print(f"❌ No se pudo registrar el error: {mail_err}")
+    finally:
+        # Siempre, incluso si todo salio bien (ahi no manda nada).
+        try:
+            return_service.flush_webhook_report()
+        except Exception as flush_err:
+            print(f"❌ No se pudo enviar el reporte del webhook: {flush_err}")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -167,7 +217,10 @@ def webhook():
         f"remote_addr={request.remote_addr} "
         f"user_agent={request.headers.get('User-Agent')!r}"
     )
-    print("tdata", thread_data)
+    # El payload completo traia customer.full_name, customer.email y la direccion
+    # del RMA al log agregado de la plataforma. Se redactan esos campos y se deja
+    # el resto: el tracking y los SKUs son lo que se necesita para operar.
+    print("payload:", _redactar_pii(thread_data))
 
     # Todo se despacha en segundo plano: el handler tiene que devolver 200 en
     # milisegundos. Si algo bloquea acá, gunicorn mata al worker por timeout y se
