@@ -52,8 +52,7 @@ correcta del depósito y moviéndolo a la caja física que usó el operario.
                                     ┌──────────┴───────────┐
                                     ▼                      ▼
                           MintsoftOrderClient       canales de error
-                          (clients/…Client.py)      ├─ ERRORES_URL (GAS)
-                                    │               └─ mail de alerta SMTP
+                          (clients/…Client.py)                                    │               └─ mail de alerta SMTP
                                     ▼
                             api.mintsoft.co.uk
 ```
@@ -99,13 +98,10 @@ services/
   mintsoft_service.py             MintsoftReturnService — toda la lógica de negocio
 mappers/
   mintsoft_mapper.py              Tabla nombre de merchant → ClientId / WarehouseId de Mintsoft
-  error_mapper.py                 ERROR_CODES (E-01 … E-07)
-  main_mapper.py                  Helper legacy/sin uso (map_return)
-  return_reason_mapper.py         Placeholder vacío
 loggers/
-  main_logger.py                  Factory de logger con archivo rotativo + stream
+  main_logger.py                  Factory de logger a stdout
 models/                           Payloads de ejemplo capturados y datos de referencia de Mintsoft (ver abajo)
-logs/                             Salida rotativa de logs (m_service.log)
+tests/                            Casos de las rutas de error (pytest)
 ```
 
 ---
@@ -118,17 +114,14 @@ logs/                             Salida rotativa de logs (m_service.log)
 | `MINTSOFT_USERNAME` | ✅ | `clients/mintsoftClient.py` | Usuario para `POST /api/Auth` de Mintsoft. Si falta → `RuntimeError` al importar. |
 | `MINTSOFT_PASSWORD` | ✅ | `clients/mintsoftClient.py` | Contraseña de Mintsoft. |
 | `GAS_URL` | ✅ | `listener.py` | Endpoint de Google Apps Script que archiva cada payload crudo del webhook. |
-| `ERRORES_URL` | ✅ | `services/mintsoft_service.py` | Endpoint de Google Apps Script que recibe las filas de error por item. |
 | `PORT` | – | `listener.py` | Puerto del servidor de desarrollo / gunicorn. Default `8080`. |
 | `SMTP_HOST` | – | service | Servidor SMTP para los mails de alerta. Si falta alguna variable SMTP, las alertas se saltean con un warning. |
 | `SMTP_PORT` | – | service | Default `587`. |
 | `SMTP_USER` | – | service | Login SMTP; también el `From` por defecto. |
 | `SMTP_PASSWORD` | – | service | Contraseña SMTP. |
 | `ALERT_EMAIL_FROM` | – | service | Sobreescribe la dirección `From`. |
-| `LOG_DIR` | – | `loggers/main_logger.py` | Default `logs`. |
+| `LOG_LEVEL` | – | `loggers/main_logger.py` | Default `INFO`. Los logs van a stdout. |
 | `LOG_LEVEL` | – | logger | Default `INFO`. |
-| `LOG_MAX_BYTES` | – | logger | Default `10485760` (10 MB). |
-| `LOG_BACKUP_COUNT` | – | logger | Default `5`. |
 
 `clients/mintsoftClient.py` llama a `load_dotenv()`, así que un archivo `.env` local funciona.
 
@@ -149,7 +142,6 @@ WEBHOOK_SECRET=...
 MINTSOFT_USERNAME=...
 MINTSOFT_PASSWORD=...
 GAS_URL=https://script.google.com/macros/s/.../exec
-ERRORES_URL=https://script.google.com/macros/s/.../exec
 ENV
 
 python listener.py            # servidor de desarrollo en :8080
@@ -464,35 +456,51 @@ refrescar `models/`, no forman parte del flujo del request.
 
 Dos canales independientes, ambos best-effort y no fatales.
 
-### 1. Códigos de error → Google Sheet
+### 1. Un webhook, un reporte
 
-`mappers/error_mapper.py`:
+No existen códigos de error `E-01`…`E-07` ni un `_log_failed_items` que postee filas a una
+planilla: eso lo describía una versión anterior de este README y nunca estuvo en el código.
 
-| Código | Clave | Cuándo se genera |
-|---|---|---|
-| `E-01` | `FETCH_ORDERS_FAILED` | falló `/api/Order/List` |
-| `E-02` | `SKU_NOT_RESOLVABLE` | no se pudo resolver el barcode a un SKU |
-| `E-03` | `CREATE_RETURN_FAILED` | falla genérica al crear el return |
-| `E-04` | `ALLOCATE_ITEMS_FAILED` | falló la asignación de items en un return **externo** |
-| `E-05` | `ADD_ITEMS_FAILED` | falló el agregado de items a un return **interno** |
-| `E-06` | `REALLOCATE_ITEMS_FAILED` | falló el paso de transferencia/cuarentena |
-| `E-07` | `CLIENT_NOT_MAPPED` | merchant ausente en `mappers/mintsoft_mapper.py` |
+`procesar_webhook` abre un reporte al empezar (`begin_webhook_report`) y lo cierra en un
+`finally` (`flush_webhook_report`). Cada capa que falla llama a `_send_error_email(...)`, que
+**acumula** el problema en vez de mandar un mail propio. Al terminar el evento sale **un único
+mail** con todos los problemas, deduplicados por `(mensaje de error, SKU)` — necesario porque
+`allocate_external_return_items` y `reallocate_return_items` reportan y además re-lanzan, así
+que el catch-all del listener ve la misma excepción.
 
-`_log_failed_items` postea **una fila por line item fallido** a `ERRORES_URL`: una copia del
-payload original con `event_data.line_items` reducido a ese único item, más `error_code` y
-`error_description`. Esto hace que cada fila se pueda reprocesar individualmente.
+El reporte es `threading.local()`: el service es una instancia única compartida por los 10
+threads del executor, pero `procesar_webhook` y todo lo que llama corren en el mismo thread.
 
-### 2. Mail de alerta
+### 2. Qué dice el mail
 
-`_send_error_email` arma un mensaje con asunto
-`[MintsoftReturnService] {code} - {description} | POReference: {reference}` y un cuerpo que
-contiene la referencia, el timestamp UTC, el host, el tipo de excepción, el contexto en JSON y
-el traceback completo. Nunca lanza excepciones — los problemas de SMTP se loguean y se
-absorben.
+Asunto: `[Mintsoft] {merchant} - {qué falta} - PO {referencia}`.
 
-> ⚠️ **El envío está actualmente desactivado**: las líneas `server.login(...)` y
-> `server.send_message(...)` están comentadas (marcadas con `CAMBIAR`), así que la conexión SMTP
-> se abre y se cierra sin entregar nada, y el log igual reporta "Error alert email sent".
+El cuerpo lista cada problema con:
+
+| Campo | Contenido |
+|---|---|
+| `que_falta` | qué quedó sin hacer, en una línea (ej. *"El return externo 12772 quedó con items sin ubicar y SIN confirmar"*) |
+| `SKU` | los SKUs afectados, cuando aplica |
+| `Paso` | el método donde falló |
+| `Que hacer` | la reparación manual concreta |
+| `Error` | tipo y mensaje de la excepción |
+| `Contexto` | ids relevantes (return_id, warehouse, client_id) |
+
+Los tracebacks van al final y una sola vez cada uno: son lo más largo y lo que menos sirve para
+arreglar el return a mano.
+
+La distinción que más importa operativamente es si **el return existe** en Mintsoft y solo falta
+mover stock, o si **no se creó nada**. Cada `que_falta` lo dice explícitamente.
+
+### 3. Alertas de configuración
+
+`mappers/mintsoft_mapper.py` manda dos alertas aparte, que no son de un return puntual sino de
+configuración, con un throttle de `ALERT_THROTTLE_SECONDS` (default 30 min) por asunto:
+
+- **`Cliente no mapeado: <nombre>`** — el merchant no está en la tabla `clients`.
+- **`Payload sin merchant`** — no se pudo extraer el nombre del merchant del payload.
+
+El throttle es por proceso: con `--workers 2` el techo real son 2 mails por ventana.
 
 ### Referencia del return usada en los reportes
 
@@ -521,7 +529,7 @@ Mintsoft son de un solo intento.
 
 ## Logging
 
-`loggers/main_logger.py` construye un logger con un `RotatingFileHandler`
+`loggers/main_logger.py` construye un logger con un `StreamHandler a stdout`
 (`logs/m_service.log`, 10 MB × 5 backups) y un stream handler, con el formato:
 
 ```
@@ -555,13 +563,13 @@ Fixtures capturados, útiles para reproducir casos y para buscar los ids hardcod
 
 Documentados tal cual están; cada punto es un comportamiento real del código actual.
 
-1. **El webhook siempre responde `200`.** Las fallas solo se ven en la planilla de errores, en
-   el mail de alerta (hoy desactivado) y en los logs. Two Boxes nunca va a reintentar.
+1. **El webhook siempre responde `200`.** Las fallas se reportan por mail y en los logs.
+   Two Boxes nunca va a reintentar.
 2. **Los mails de alerta sí se envían.** Ya no hay nada comentado en `_send_error_email`. Como
    `map_client` se invoca en varios puntos del flujo, un mismo payload malo puede generar varias
    alertas idénticas; no hay deduplicación.
-3. **`alert_email_to` tiene una coma final**, lo que la convierte en una tupla en lugar de un
-   string, y está hardcodeada en vez de leerse de `ALERT_EMAIL_TO`.
+3. **Los destinatarios de alerta salen de `ALERT_EMAIL_TO`**, con la misma lista por defecto
+   en el service y en el mapper.
 4. **Los returns internos ya respetan el warehouse mapeado.** `create_return` pasa
    `map_warehouse(merchant)` en vez de un `3` fijo, y el cliente lo envía como query param
    `WarehouseId`. Antes recibía el argumento y no lo mandaba, así que Mintsoft usaba el warehouse
@@ -593,8 +601,8 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
     exactamente cómo se perdió la causa de una falla de producción.
 12. **Dos `sleep` de 3 segundos** rodean la creación de productos al vuelo, ocupando un thread
     del pool de 10 slots por más de 6 segundos por cada SKU nuevo.
-13. **`mappers/main_mapper.py` (`map_return`) no se usa** en el flujo del request, y
-    `mappers/return_reason_mapper.py` está vacío.
+13. **El `event_type` se filtra en el listener.** Solo los tipos de `EVENT_TYPES`
+    (default `return-complete`) se procesan en Mintsoft; el resto se archiva y se saltea.
 14. **Los ids de ubicación, de warehouse y de return reason están hardcodeados.** Si se
     renombran o recrean ubicaciones en Mintsoft, hay que editar `services/mintsoft_service.py`.
 15. **Los items con barcode de 7 caracteres o menos y SKU no encontrado se arreglan a mano.** El

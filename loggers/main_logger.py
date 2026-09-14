@@ -1,48 +1,34 @@
 import logging
 import os
 import sys
-from logging.handlers import RotatingFileHandler
 
-
-LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", 10 * 1024 * 1024))  # 10MB
-LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", 5))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 
-def _ensure_log_dir():
-    os.makedirs(LOG_DIR, exist_ok=True)
+def get_logger(name: str, filename: str = None) -> logging.Logger:
+    """Logger a stdout.
 
-
-def get_logger(name: str, filename: str) -> logging.Logger:
-
-    _ensure_log_dir()
-
+    Antes esto escribia ademas a logs/<filename> con un RotatingFileHandler de
+    10 MB x 5. En un PaaS ese archivo vive en el disco efimero del contenedor:
+    se pierde en cada deploy y nadie lo lee nunca, mientras que stdout si va al
+    log agregado de la plataforma. El parametro `filename` se mantiene por
+    compatibilidad con los callers pero se ignora.
+    """
     logger = logging.getLogger(name)
     logger.setLevel(LOG_LEVEL)
 
     if logger.handlers:
         return logger
 
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     )
-
-    file_handler = RotatingFileHandler(
-        os.path.join(LOG_DIR, filename),
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
+    logger.addHandler(handler)
+    # Sin propagar: el root logger de gunicorn duplicaria cada linea.
+    logger.propagate = False
 
     return logger

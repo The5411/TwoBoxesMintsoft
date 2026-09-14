@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [clean-import, bug-fixes]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Misma version que produccion. El codigo usa f-strings con comillas
+          # anidadas (PEP 701): en 3.11 es SyntaxError al importar.
+          python-version-file: .python-version
+      - run: pip install -r requirements.txt pytest
+      - name: Compilar todo (detecta SyntaxError antes del deploy)
+        run: python -m compileall -q listener.py clients services mappers loggers
+      - name: Tests
+        run: python -m pytest tests/ -q

@@ -1,10 +1,14 @@
 from flask import Flask, request, jsonify
+import hmac
 import os
+import threading
 import traceback
+from collections import OrderedDict
 import requests
 from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor
 from services.mintsoft_service import MintsoftReturnService
+from mappers.mintsoft_mapper import _send_alert_email
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 load_dotenv()
@@ -14,6 +18,48 @@ return_service = MintsoftReturnService()
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 GAS_URL = os.environ.get("GAS_URL")
 WEBHOOKS_URL = os.environ.get("WEBHOOKS_URL")
+
+# Tipos de evento que este servicio sabe procesar. Two Boxes manda todo a la misma
+# URL y antes no se miraba event_type en ningun lado, asi que cualquier tipo con
+# otra forma entraba igual a procesar_webhook.
+EVENT_TYPES_SOPORTADOS = {
+    t.strip() for t in os.environ.get("EVENT_TYPES", "return-complete").split(",") if t.strip()
+}
+
+# Rechazar cuerpos gigantes antes de parsearlos.
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", 5 * 1024 * 1024))
+
+# --- Guarda de reentrega (parcial de COR-07) --------------------------------------
+# NO es idempotencia de verdad: vive en memoria, se pierde en cada reinicio y no se
+# comparte entre los workers de gunicorn. Solo frena la reentrega del MISMO event_id
+# al mismo worker, que es el caso comun cuando Two Boxes reintenta. La regla
+# operativa sigue en pie: no reenviar webhooks a mano hasta que exista la
+# persistencia (E-1), porque un reenvio que caiga en el otro worker SI duplica.
+_EVENTOS_VISTOS_MAX = 2000
+_eventos_vistos = OrderedDict()
+_eventos_lock = threading.Lock()
+
+# Contadores para /health.
+_metricas = {"recibidos": 0, "procesados": 0, "fallados": 0, "duplicados": 0, "ignorados": 0}
+_metricas_lock = threading.Lock()
+
+
+def _contar(clave):
+    with _metricas_lock:
+        _metricas[clave] = _metricas.get(clave, 0) + 1
+
+
+def _ya_procesado(event_id) -> bool:
+    """True si este worker ya vio ese event_id. Lo registra si es nuevo."""
+    if not event_id:
+        return False
+    with _eventos_lock:
+        if event_id in _eventos_vistos:
+            return True
+        _eventos_vistos[event_id] = True
+        while len(_eventos_vistos) > _EVENTOS_VISTOS_MAX:
+            _eventos_vistos.popitem(last=False)
+    return False
 
 
 executor = ThreadPoolExecutor(max_workers=10)
@@ -136,11 +182,23 @@ def procesar_webhook(data):
 
         # Agregar items al return en caso de que sea interno
         if return_id[1] == "Internal Return Created":
-          return_service.add_return_items(return_id[0], data)
+            # add_return_items devuelve False si el return no quedo armado. Antes
+            # absorbia la excepcion y devolvia None, y el listener llamaba igual a
+            # reallocate_return_items: el stock se movia FISICAMENTE de RET/RET-TEMP
+            # a la caja del operario para un return que habia quedado sin items y
+            # sin confirmar. Quedaba mercaderia en una caja sin ningun return que la
+            # respalde. Ahora, si el armado fallo, no se toca el stock: queda en el
+            # staging, con el reporte diciendo que hay que completarlo a mano.
+            armado_ok = return_service.add_return_items(return_id[0], data)
 
-        
-          # Pasar items de RET o RET-QT a la caja del return si es Internal
-          return_service.reallocate_return_items(data)
+            if armado_ok is False:
+                print(
+                    f"⚠️ El armado del return {return_id[0]} fallo: NO se reubica el "
+                    f"stock. Queda en RET / RET-TEMP esperando intervencion."
+                )
+            else:
+                # Pasar items de RET o RET-QT a la caja del return si es Internal
+                return_service.reallocate_return_items(data)
 
         # No afirmar exito cuando no se creo nada: "Webhook procesado con exito"
         # se imprimia igual con (None, "No Return Created"), que es justo el caso
@@ -148,12 +206,14 @@ def procesar_webhook(data):
         if return_id and return_id[1] == "No Return Created":
             print(f"⚠️ Webhook NO produjo return en Mintsoft ({return_id[1]})")
         else:
+            _contar("procesados")
             print("Webhook procesado con exito")
 
     except Exception as e:
         # Catch-all: cualquier fallo que no haya sido capturado (y notificado) dentro
         # de MintsoftReturnService llega hasta acá. Sin esto el error solo se imprimía
         # en los logs y nadie se enteraba.
+        _contar("fallados")
         print(f"Error procesando webhook: {e}")
         traceback.print_exc()
         try:
@@ -182,10 +242,18 @@ def procesar_webhook(data):
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # hmac.compare_digest en vez de !=: la comparacion de strings corta en el
+    # primer byte distinto, y ese tiempo distinto filtra el secreto de a un
+    # caracter por vez.
     token = request.headers.get("x-two-boxes-authorization")
-    if not token or token != WEBHOOK_SECRET:
-        print(f"Unauthorized Access Request")
+    if not WEBHOOK_SECRET:
+        print("❌ WEBHOOK_SECRET no esta seteada: se rechaza todo")
         return jsonify({"error": "Unauthorized"}), 401
+    if not token or not hmac.compare_digest(str(token), str(WEBHOOK_SECRET)):
+        print(f"Unauthorized Access Request desde {request.remote_addr}")
+        return jsonify({"error": "Unauthorized"}), 401
+
+    _contar("recibidos")
     
     raw_data = request.get_json(silent=True)
     if not raw_data:
@@ -222,12 +290,56 @@ def webhook():
     # el resto: el tracking y los SKUs son lo que se necesita para operar.
     print("payload:", _redactar_pii(thread_data))
 
+    # COR-26 -- solo los tipos soportados llegan a Mintsoft. Two Boxes manda todo
+    # a la misma URL y antes no se miraba event_type en ningun lado, asi que un
+    # tipo con otra forma entraba igual a procesar_webhook y fallaba adentro. Se
+    # archiva igual (abajo) para no perder el evento, pero no se escribe en el WMS.
+    procesable = event_type in EVENT_TYPES_SOPORTADOS
+    if not procesable:
+        _contar("ignorados")
+        print(
+            f"⏭️ event_type={event_type!r} no soportado "
+            f"(soportados: {sorted(EVENT_TYPES_SOPORTADOS)}). "
+            f"Se archiva pero NO se procesa en Mintsoft."
+        )
+        # Avisar por mail, no solo loguear: si Two Boxes empieza a mandar un tipo
+        # nuevo que SI habria que procesar, una linea en el log no lo hace visible.
+        # Va con el throttle del mapper (ALERT_THROTTLE_SECONDS, default 30 min) y
+        # el asunto lleva el event_type, asi que un tipo de alto volumen manda un
+        # mail por ventana y no uno por evento.
+        _send_alert_email(
+            subject=f"[Mintsoft] event_type no soportado: {event_type!r}",
+            body=(
+                f"Llego un webhook con event_type={event_type!r}, que no esta en la "
+                f"lista de tipos soportados ({sorted(EVENT_TYPES_SOPORTADOS)}).\n\n"
+                f"El payload se archivo igual, pero NO se escribio nada en Mintsoft: "
+                f"no se creo el return ni se movio stock.\n\n"
+                f"Si este tipo SI hay que procesarlo, agregarlo a la variable de "
+                f"entorno EVENT_TYPES (separada por comas). No requiere cambio de "
+                f"codigo, pero si reiniciar el servicio.\n\n"
+                f"event id:   {event_id}\n"
+                f"merchant:   {merchant}\n"
+                f"line_items: {n_items}\n"
+                f"origen:     {request.remote_addr} / {request.headers.get('User-Agent')!r}"
+            ),
+        )
+
+    # Guarda de reentrega: parcial, por proceso. Ver el comentario de _ya_procesado.
+    if procesable and _ya_procesado(event_id):
+        procesable = False
+        _contar("duplicados")
+        print(
+            f"⏭️ event_id={event_id!r} ya fue procesado por este worker: se saltea "
+            f"para no crear un segundo return. Se archiva igual."
+        )
+
     # Todo se despacha en segundo plano: el handler tiene que devolver 200 en
     # milisegundos. Si algo bloquea acá, gunicorn mata al worker por timeout y se
     # pierde el resto del procesamiento sin dejar rastro.
 
     # 1. Procesarlo en Mintsoft (la operación de negocio, va primero)
-    executor.submit(procesar_webhook, raw_data)
+    if procesable:
+        executor.submit(procesar_webhook, raw_data)
 
     # 2. Subir JSON al Google Drive
     executor.submit(enviar_a_google_async, thread_data)
@@ -236,6 +348,24 @@ def webhook():
     executor.submit(enviar_webhook_por_sku, thread_data)
 
     return "", 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Estado del servicio y contadores. No toca Mintsoft: tiene que responder
+    aunque el WMS este caido, que es justo cuando el health check importa."""
+    with _metricas_lock:
+        metricas = dict(_metricas)
+    return jsonify({
+        "status": "ok",
+        "event_types_soportados": sorted(EVENT_TYPES_SOPORTADOS),
+        "config": {
+            "webhook_secret": bool(WEBHOOK_SECRET),
+            "gas_url": bool(GAS_URL),
+            "webhooks_url": bool(WEBHOOKS_URL),
+        },
+        "metricas": metricas,
+    }), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))

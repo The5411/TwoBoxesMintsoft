@@ -1,4 +1,5 @@
 import os
+import threading
 import requests
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
@@ -20,7 +21,30 @@ class MintsoftOrderClient:
                 "(MINTSOFT_USERNAME / MINTSOFT_PASSWORD)"
             )
 
-        self.api_key = self._authenticate()
+        # La key NO se pide en el constructor. Antes se llamaba a _authenticate()
+        # aca, y como el service se instancia al importar listener.py, eso tenia
+        # tres consecuencias: si Mintsoft estaba caida la aplicacion no levantaba
+        # (el worker moria en el import), la key se pedia una vez por worker en
+        # cada deploy, y despues vivia semanas sin refrescarse hasta el proximo
+        # reinicio. Ahora se pide en la primera llamada real y se renueva sola
+        # ante un 401.
+        self._api_key: Optional[str] = None
+        self._auth_lock = threading.Lock()
+
+    @property
+    def api_key(self) -> str:
+        """La key vigente, pidiendola si todavia no se pidio. Thread-safe."""
+        if self._api_key is None:
+            with self._auth_lock:
+                if self._api_key is None:
+                    self._api_key = self._authenticate()
+        return self._api_key
+
+    def _refresh_api_key(self) -> str:
+        """Fuerza una key nueva. Se llama cuando Mintsoft contesta 401."""
+        with self._auth_lock:
+            self._api_key = self._authenticate()
+        return self._api_key
 
     def _authenticate(self) -> str:
         """Pide una ms-apikey a Mintsoft.
@@ -39,6 +63,22 @@ class MintsoftOrderClient:
         r = requests.post(url, json=payload, timeout=120)
         r.raise_for_status()
         return r.json()
+
+    def _request(self, method: str, url: str, **kwargs):
+        """Hace el request y, ante un 401, renueva la key y reintenta UNA vez.
+
+        Un 401 significa que la key expiro; el request no llego a ejecutarse del
+        lado de Mintsoft, asi que reintentarlo no puede duplicar nada. Cualquier
+        otro status se devuelve tal cual para que lo maneje el caller.
+        """
+        kwargs.setdefault("timeout", 120)
+        headers = dict(kwargs.pop("headers", None) or self.headers())
+
+        r = requests.request(method, url, headers=headers, **kwargs)
+        if r.status_code == 401:
+            headers["ms-apikey"] = self._refresh_api_key()
+            r = requests.request(method, url, headers=headers, **kwargs)
+        return r
 
     @staticmethod
     def _toolkit_result(r, what: str) -> Dict[str, Any]:
@@ -87,9 +127,8 @@ class MintsoftOrderClient:
         if status_id is not None:
             params["OrderStatusId"] = status_id
 
-        r = requests.get(
+        r = self._request("GET", 
             url,
-            headers=self.headers(),
             params=params,
             timeout=120,
         )
@@ -107,9 +146,8 @@ class MintsoftOrderClient:
         """
         url = f"{self.BASE_URL}/api/Order/Search"
 
-        r = requests.get(
+        r = self._request("GET", 
             url,
-            headers=self.headers(),
             params={
                 "OrderNumber": order_number,
                 "exactMatch": "true" if exact_match else "false",
@@ -141,9 +179,8 @@ class MintsoftOrderClient:
         if reference:
             params["Reference"] = reference
 
-        r = requests.post(
+        r = self._request("POST", 
             url,
-            headers=self.headers(),
             params=params,
             timeout=120,
         )
@@ -160,9 +197,8 @@ class MintsoftOrderClient:
         print("data", data)
         url = f"{self.BASE_URL}/api/Return/CreateExternalReturn"
 
-        r = requests.post(
+        r = self._request("POST", 
             url,
-            headers=self.headers(),
             json=data,
             timeout=120,
         )
@@ -186,9 +222,8 @@ class MintsoftOrderClient:
     def add_return_item(self, return_id: int, item_data: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.BASE_URL}/api/Return/{return_id}/AddItem"
         
-        r = requests.post(
+        r = self._request("POST", 
             url,
-            headers=self.headers(),
             json=item_data,
             timeout=120
         )
@@ -202,9 +237,8 @@ class MintsoftOrderClient:
         
         url = f"{self.BASE_URL}/api/Return/{return_id}/AllocateItemLocation?ReturnitemId={item_id}&Quantity={quantity}&LocationId={location_id}" 
         
-        r = requests.post(
+        r = self._request("POST", 
             url,
-            headers=self.headers(),
             timeout=120
         )
         r.raise_for_status()
@@ -213,28 +247,12 @@ class MintsoftOrderClient:
     def confirm_return(self, return_id: int) -> Dict[str, Any]:
         url = f"{self.BASE_URL}/api/Return/{return_id}/Confirm"
         
-        r = requests.post(
+        r = self._request("POST", 
             url,
-            headers=self.headers(),
             timeout=120
         )
         r.raise_for_status()
         return r.json()
-    
-    def get_warehouse_locations(self, warehouse_id:int):
-        url = f"{self.BASE_URL}/api/Warehouse/{warehouse_id}/Location/All"
-
-        r = requests.get(
-            url,
-            headers=self.headers(),
-            timeout=120,
-        )
-
-        r.raise_for_status()
-        data = r.json()
-        with open('mintsoft_warehouse_locations_model.json', 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        return data
     
     def transfer_stock(self, data: Dict):
         """Mueve stock entre ubicaciones/cajas. Lanza si Mintsoft lo rechaza.
@@ -245,10 +263,9 @@ class MintsoftOrderClient:
         """
         url = f"{self.BASE_URL}/api/Warehouse/TransferStock"
 
-        r = requests.put(
+        r = self._request("PUT", 
             url,
             json=data,
-            headers=self.headers(),
             timeout=120,
         )
 
@@ -272,9 +289,8 @@ class MintsoftOrderClient:
         """
         url = f"{self.BASE_URL}/api/Warehouse/StockMovement?Action=7"
 
-        r = requests.post(
+        r = self._request("POST", 
             url=url,
-            headers=self.headers(),
             json=request,
             timeout=timeout
         )
@@ -289,38 +305,6 @@ class MintsoftOrderClient:
             )
         return response
 
-    def get_currencies(self):
-        url = f"{self.BASE_URL}/api/RefData/Currencies"
-
-        r = requests.get(
-            url,
-            headers=self.headers(),
-            timeout=120,
-        )
-
-        r.raise_for_status()
-        data = r.json()
-        print(data)
-        with open('mintsoft_currency_model.json', 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        return data
-    
-    def get_products_in_locations(self, warehouse_id:int, client_id:int):
-        url = f"{self.BASE_URL}/api/Reports/ProductsInLocationReport?warehouseId={warehouse_id}&clientId={client_id}"
-
-        r = requests.get(
-            url,
-            headers=self.headers(),
-            timeout=120,
-        )
-
-        r.raise_for_status()
-        data = r.json()
-        print(data)
-        with open('mintsoft_products_in_locations_model.json', 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        return data
-    
     def fetch_products_in_locations(self, warehouse_id: int, client_id: int,
                                     timeout: int = 30, max_pages: int = 10):
         """Filas del ProductsInLocationReport, o None si no se pudo leer completo.
@@ -345,9 +329,8 @@ class MintsoftOrderClient:
 
         try:
             for page_no in range(1, max_pages + 1):
-                r = requests.get(
+                r = self._request("GET", 
                     url,
-                    headers=self.headers(),
                     params={
                         "warehouseId": warehouse_id,
                         "clientId": client_id,
@@ -385,9 +368,8 @@ class MintsoftOrderClient:
     def get_return_reasons(self):
         url = f"{self.BASE_URL}/api/Return/Reasons"
 
-        r = requests.get(
+        r = self._request("GET", 
             url,
-            headers=self.headers(),
             timeout=120,
         )
 
@@ -399,9 +381,8 @@ class MintsoftOrderClient:
     def get_return_details(self, return_id):
         url = f"{self.BASE_URL}/api/Return/{return_id}"
 
-        r = requests.get(
+        r = self._request("GET", 
             url,
-            headers=self.headers(),
             timeout=120
         )
         r.raise_for_status()
@@ -410,9 +391,8 @@ class MintsoftOrderClient:
     def get_sku_dado_barcode(self, barcode):
         url = f"{self.BASE_URL}/api/Product/SearchBarcode"
 
-        r = requests.get(
+        r = self._request("GET", 
             url,
-            headers=self.headers(),
             params={
                 "Barcode": barcode
             },
@@ -436,9 +416,8 @@ class MintsoftOrderClient:
         # el querystring. La forma correcta ya la usan search_orders y check_carton.
         url = f"{self.BASE_URL}/api/Product/Search"
 
-        r = requests.get(
+        r = self._request("GET", 
             url,
-            headers=self.headers(),
             params={"Search": sku},
             timeout=120,
         )
@@ -466,9 +445,8 @@ class MintsoftOrderClient:
 
             url = f"{self.BASE_URL}/api/Product/Search"
 
-            r = requests.get(
+            r = self._request("GET", 
                 url,
-                headers=self.headers(),
                 params={"Search": sku_rety},
                 timeout=120,
             )
@@ -508,9 +486,8 @@ class MintsoftOrderClient:
 
         # params= en vez de interpolar: los codigos de caja escaneados pueden traer
         # caracteres que rompen el querystring (#, &, %, espacios).
-        response = requests.get(
+        response = self._request("GET", 
             url,
-            headers=self.headers(),
             params={"cartonCode": carton_code},
             timeout=120,
         )
@@ -530,10 +507,9 @@ class MintsoftOrderClient:
         """
         url = f'{self.BASE_URL}/api/StorageMedia/CreateCarton'
 
-        r = requests.post(
+        r = self._request("POST", 
             url,
             json=carton_data,
-            headers=self.headers(),
             params={"autoGenerateSSCC": "false", "clientId": client_id},
             timeout=120,
         )
@@ -547,7 +523,7 @@ class MintsoftOrderClient:
     def create_product(self, product_data):
         url = f'{self.BASE_URL}/api/Product'
 
-        r = requests.put(url, json=product_data, headers=self.headers(), timeout=120)
+        r = self._request("PUT", url, json=product_data, timeout=120)
 
         if r.status_code == 200:
             body = r.json()

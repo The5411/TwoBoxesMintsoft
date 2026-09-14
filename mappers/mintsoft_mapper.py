@@ -116,9 +116,12 @@ def _send_alert_email(subject: str, body: str) -> None:
         smtp_port = int(os.environ.get("SMTP_PORT", "587"))
         smtp_user = os.environ.get("SMTP_USER")
         smtp_password = os.environ.get("SMTP_PASSWORD")
+        # Misma lista y mismo default que MintsoftReturnService: antes habia dos
+        # listas hardcodeadas distintas en dos archivos, asi que segun por donde
+        # saliera la alerta le llegaba a gente distinta.
         email_to = os.environ.get(
             "ALERT_EMAIL_TO",
-            "mbivort@the5411.com, jcordero@the5411.com, ngurfinkel@the5411.com",
+            "bgallo@the5411.com, jcordero@the5411.com, ngurfinkel@the5411.com, mbivort@the5411.com",
         )
 
         if not (smtp_host and smtp_user and smtp_password):

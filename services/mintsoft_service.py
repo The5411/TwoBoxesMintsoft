@@ -16,7 +16,6 @@ sys.path.insert(0, ROOT)
 
 from loggers.main_logger import get_logger
 from clients.mintsoftClient import MintsoftOrderClient
-from mappers.main_mapper import map_return
 from mappers.mintsoft_mapper import map_client, map_warehouse
 
 
@@ -80,7 +79,12 @@ class MintsoftReturnService:
         self.client = MintsoftOrderClient()
         # Estados en los que una orden ya salió del depósito y por lo tanto se
         # le puede crear un return: 4=DESPATCHED, 5=INVOICED, 6=INVOICEFAILED.
-        self.returnable_status_ids = {4, 5, 6}
+        # Configurable porque son ids de Mintsoft: si cambian o hace falta sumar
+        # uno, no deberia requerir un deploy.
+        self.returnable_status_ids = {
+            int(x) for x in os.environ.get("RETURNABLE_ORDER_STATUS_IDS", "4,5,6").split(",")
+            if x.strip()
+        }
 
         # ----- Email notification config (read from environment) -----
         self.smtp_host = os.environ.get("SMTP_HOST")
@@ -896,7 +900,7 @@ class MintsoftReturnService:
 
             if not line_items:
                 self.logger.warning("No line items found in return data")
-                return None
+                return True
 
             # Guardaremos el (ReturnItemId, item, location_id) para allocarlos luego
             items_to_allocate = []
@@ -1039,9 +1043,12 @@ class MintsoftReturnService:
                     },
                 )
 
-            return None
+            return True
 
         except Exception as e:
+            # Se devuelve False (no None) para que el listener sepa que el return no
+            # quedo armado y NO mueva stock. Antes esto absorbia el error y devolvia
+            # None, indistinguible del camino exitoso.
             self.logger.error(f"Error adding items to return {return_id}: {e}", exc_info=True)
             self._send_error_email(
                 method="add_return_items",
@@ -1054,7 +1061,7 @@ class MintsoftReturnService:
                     f"ubicarlos en RET / RET-TEMP y confirmarlo."
                 ),
             )
-            return None
+            return False
     
     def reallocate_return_items(self, data):
         # Igual que en allocate_external_return_items: la extraccion del payload va
