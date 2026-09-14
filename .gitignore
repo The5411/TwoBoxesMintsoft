@@ -20,7 +20,10 @@ __pycache__/
 venv/
 env/
 ENV/
-.python-version
+# OJO: .python-version NO va acá. Es el pin de version del proyecto, no un
+# artefacto de virtualenv: lo leen mise (que es lo que usa produccion) y el
+# setup-python del CI. Estando ignorado, `git add .python-version` lo saltea en
+# silencio y el workflow falla con "python-version-file not found".
 
 # ---- Packaging / build ----
 build/
