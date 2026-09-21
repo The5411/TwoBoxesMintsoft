@@ -36,6 +36,18 @@ def _env_bool(nombre: str, default: bool) -> bool:
     return str(crudo).strip().lower() in ("1", "true", "yes", "y", "on", "si")
 
 
+def _env_float(nombre: str, default: float) -> float:
+    crudo = os.environ.get(nombre)
+    if crudo is None or not str(crudo).strip():
+        return default
+    try:
+        return float(str(crudo).strip())
+    except ValueError:
+        raise RuntimeError(
+            f"{nombre}={crudo!r} no es un numero valido"
+        ) from None
+
+
 def _env_set(nombre: str, default: str):
     crudo = os.environ.get(nombre, default)
     return {x.strip() for x in str(crudo).split(",") if x.strip()}
@@ -178,6 +190,19 @@ RETURNABLE_ORDER_STATUS_IDS = _env_int_set("RETURNABLE_ORDER_STATUS_IDS", "4,5,6
 
 # Mintsoft corta la Reference en 50 caracteres.
 REFERENCE_MAX_LEN = _env_int("REFERENCE_MAX_LEN", 50)
+
+
+# --- Alta de productos al vuelo -----------------------------------------------
+# El schema Product de Mintsoft marca Weight como requerido junto con SKU, y
+# create_product no lo mandaba: un alta durante un return externo podia volver
+# con Success=false sin que el motivo fuera evidente.
+#
+# 0 es un placeholder deliberado, no una medicion: significa "no lo sabemos". El
+# payload de Two Boxes no trae el peso, y estos productos son SKUs que no existian
+# en Mintsoft, que un operador tiene que completar a mano de todas formas. Se
+# manda el campo para satisfacer el schema, se avisa en el log, y queda
+# configurable por si hace falta otro valor.
+PRODUCT_DEFAULT_WEIGHT = _env_float("PRODUCT_DEFAULT_WEIGHT", 0.0)
 
 
 # --- Webhook ------------------------------------------------------------------

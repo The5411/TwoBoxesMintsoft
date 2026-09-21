@@ -116,6 +116,8 @@ class MintsoftReturnService:
         """
         self._reporte.problemas = []
         self._reporte.event_key = event_key
+        # Cache de productos con alcance de este webhook. Ver _cache_productos.
+        self._reporte.productos = {}
         try:
             self._reporte.referencia = self._return_identifier(data)
         except Exception:
@@ -140,6 +142,9 @@ class MintsoftReturnService:
         """Manda UN mail con todos los problemas del webhook, y cierra el reporte."""
         problemas = getattr(self._reporte, "problemas", None)
         self._reporte.problemas = None
+        # El cache de productos muere con el webhook: no puede sobrevivir al
+        # siguiente, que puede ser de otro cliente.
+        self._reporte.productos = None
         if not problemas:
             return
         try:
@@ -524,18 +529,54 @@ class MintsoftReturnService:
             context={"return_id": return_id, "kind": kind, "event_key": event_key},
         )
 
+    def _cache_productos(self) -> Dict[Any, Any]:
+        """Cache de SKU -> (sku, product_id) con alcance de UN webhook.
+
+        Vive en el thread-local del reporte, no en la instancia: el service es
+        único y lo comparten los threads del pool del listener, así que un cache
+        de instancia mezclaría clientes distintos y quedaría desactualizado entre
+        webhooks. Al ser thread-local, cada webhook ve solo el suyo y se descarta
+        al terminar.
+        """
+        cache = getattr(self._reporte, "productos", None)
+        if cache is None:
+            cache = {}
+            self._reporte.productos = cache
+        return cache
+
     def _resolver_product_id(self, item, client_id, *, crear_si_falta: bool):
         """(sku, product_id) para un line item, dando de alta el SKU si hace falta.
 
         Unifica lo que las dos ramas hacían por separado: la externa creaba el
         producto y la interna se limitaba a descartar el item. Devuelve
         product_id=None si no se pudo resolver y `crear_si_falta` es False.
-        """
-        sku = (item or {}).get("sku")
-        barcode = _get_item_barcode(item)
-        sku, product_id = self.client.get_product_id(sku, client_id, barcode)
 
-        if product_id is not None or not crear_si_falta:
+        El resultado se cachea por webhook: el mismo SKU se resolvía hasta tres
+        veces contra Mintsoft (create_return, add_return_items y
+        reallocate_return_items), y cada resolución son una o dos llamadas HTTP
+        -- dos si hay que caer al fallback por barcode. Un return de RMA con
+        varias unidades del mismo SKU las multiplicaba.
+        """
+        sku_original = (item or {}).get("sku")
+        if isinstance(sku_original, str):
+            sku_original = sku_original.strip()
+        cache = self._cache_productos()
+        clave = (client_id, str(sku_original))
+
+        # Solo se cachean las resoluciones exitosas. Un None puede venir de una
+        # llamada con crear_si_falta=False, y en ese caso una llamada posterior
+        # con crear_si_falta=True todavía tiene que poder dar de alta el SKU.
+        if clave in cache:
+            return cache[clave]
+
+        barcode = _get_item_barcode(item)
+        sku, product_id = self.client.get_product_id(sku_original, client_id, barcode)
+
+        if product_id is not None:
+            cache[clave] = (sku, product_id)
+            return sku, product_id
+
+        if not crear_si_falta:
             return sku, product_id
 
         # El SKU no existe en Mintsoft: se da de alta.
@@ -544,8 +585,20 @@ class MintsoftReturnService:
             "Name": ((item or {}).get("product_variant") or {}).get("name") or (item or {}).get("sku"),
             "EAN": barcode,
             "ClientId": client_id,
+            # Weight es requerido por el schema Product y antes no se mandaba, asi
+            # que el alta podia volver con Success=false. El valor es un
+            # placeholder: el payload de Two Boxes no trae el peso. Ver
+            # config.PRODUCT_DEFAULT_WEIGHT.
+            "Weight": config.PRODUCT_DEFAULT_WEIGHT,
         }
         product_id = self.client.create_product(nuevo)
+        if product_id is not None:
+            self.logger.warning(
+                f"SKU {sku!r} dado de alta al vuelo en Mintsoft (ProductId "
+                f"{product_id}) con Weight={config.PRODUCT_DEFAULT_WEIGHT} como "
+                f"placeholder: el payload de Two Boxes no trae el peso. Hay que "
+                f"completar la ficha del producto a mano."
+            )
         if product_id is None:
             # Mintsoft rechaza el CreateExternalReturn entero si un item viene con
             # ProductId null, pero el mensaje que devuelve no dice cual fue. Fallar
@@ -557,6 +610,7 @@ class MintsoftReturnService:
             )
         # Sleep corto para no saturar la API despues de un alta.
         time.sleep(3)
+        cache[clave] = (sku, product_id)
         return sku, product_id
 
     def _asegurar_caja(self, carton_code, warehouse, client_id) -> None:
@@ -1026,7 +1080,11 @@ class MintsoftReturnService:
 
                 product_id = None
                 try:
-                    sku, product_id = self.client.get_product_id(sku, client_id, _get_item_barcode(item))
+                    # Por el helper, no por el cliente directo: asi comparte el
+                    # cache de SKUs con create_return y reallocate_return_items.
+                    sku, product_id = self._resolver_product_id(
+                        item, client_id, crear_si_falta=False
+                    )
                 except Exception as e:
                     self.logger.error(f"Error al obtener product_id para SKU {sku}: {e}", exc_info=True)
                     dropped_items.append({"sku": sku, "motivo": f"{type(e).__name__}: {e}"})
@@ -1170,6 +1228,9 @@ class MintsoftReturnService:
         # Items que nunca llegaron (disposition='Missing'): no hay stock que mover.
         # Se cuentan aparte para no mezclarlos con los que SI deberian tener caja.
         faltantes: List[str] = []
+        # Items cuya reubicacion fallo contra Mintsoft. Se juntan y se reportan
+        # todos juntos al final, en vez de cortar en el primero.
+        fallados: List[Dict[str, str]] = []
         # El reporte de stock se baja una sola vez por llamada, no por item.
         stock_cache: Dict[Any, Any] = {}
 
@@ -1200,127 +1261,157 @@ class MintsoftReturnService:
                     faltantes.append(str(sku))
                     continue
 
-                sku, product_id = self._resolver_product_id(
-                    item, client_id, crear_si_falta=False
-                )
-                carton_code = (item.get("put_away_bin") or "").strip()
-
-                if not carton_code:
-                    # Sin caja destino, el TransferStock iria a DestinationNameOrCode=""
-                    # y antes ademas check_carton devolvia True para el codigo vacio.
-                    self.logger.error(
-                        f"Item {sku} sin put_away_bin: no hay caja destino, se saltea la "
-                        f"reubicacion de stock."
+                # Un item que falla NO puede abortar la reubicacion de los
+                # demas. Antes este loop re-lanzaba en el primer error, asi que
+                # el stock de todos los items siguientes quedaba en RET /
+                # RET-TEMP sin que el mail dijera cuales. add_return_items ya
+                # juntaba sus items caidos; esto lo hace simetrico.
+                try:
+                    sku, product_id = self._resolver_product_id(
+                        item, client_id, crear_si_falta=False
                     )
-                    sin_caja.append(str(sku))
+                    carton_code = (item.get("put_away_bin") or "").strip()
+
+                    if not carton_code:
+                        # Sin caja destino, el TransferStock iria a DestinationNameOrCode=""
+                        # y antes ademas check_carton devolvia True para el codigo vacio.
+                        self.logger.error(
+                            f"Item {sku} sin put_away_bin: no hay caja destino, se saltea la "
+                            f"reubicacion de stock."
+                        )
+                        sin_caja.append(str(sku))
+                        continue
+
+                    disposition = item.get("disposition")
+                    if config.es_buen_estado(disposition): # Stock en buenas condiciones
+
+                        reallocation_data = {
+                            "SourceWarehouseId": warehouse,
+                            "SourceNameOrCode": config.SOURCE_GOOD,
+                            "DestinationWarehouseId": warehouse,
+                            "DestinationNameOrCode": carton_code,
+                            "ProductId": product_id,
+                            "Quantity": item.get("quantity"),
+                            "Comment": "Return reallocation",
+                        }
+
+                        self._asegurar_caja(carton_code, warehouse, client_id)
+
+                        response = self._transfer_stock_resiliente(
+                            reallocation_data, sku, client_id, stock_cache
+                        )
+                        responses.append(response)
+                        self.logger.info(f"{sku}: transfer a {carton_code!r} -> {response}")
+
+                    else: # Stock a mandar a cuarentena
+
+                        # El TransferStock de abajo lleva Type='Quarantine', asi que solo
+                        # mueve stock YA cuarentenado. Que la unidad llegue cuarentenada a
+                        # RET-TEMP depende de la rama, y no es igual en las dos:
+                        #
+                        #  - Return INTERNO: add_return_items alloca el item a RET-TEMP y
+                        #    DESPUES confirma, asi que el StockAction='Quarantine' de
+                        #    ReturnReasonId=2 cae sobre la unidad ya ubicada y la deja en
+                        #    RET-TEMP con Type='Quarantine'. Acá el transfer funciona.
+                        #
+                        #  - Return EXTERNO: CreateExternalReturn crea el return YA
+                        #    confirmado, o sea que la cuarentena se aplica ANTES de que el
+                        #    item tenga ubicacion. Recien despues AllocateItemLocation lo
+                        #    deja en RET-TEMP, y lo deja como Type='Allocation'. El segundo
+                        #    confirm_return no re-aplica nada porque ya estaba confirmado.
+                        #    Resultado: no hay stock cuarentenado en RET-TEMP y el transfer
+                        #    falla con "Could not find any of product ID: X in RET-TEMP!".
+                        #
+                        # Verificado con el return de tracking 9434636208303429481960
+                        # (SKU W836-2-Chocolate-6, disposition 'Exception', Bronze Snake):
+                        # quedo en RET-TEMP con Type='Allocation' y sin caja asociada.
+                        #
+                        # Por eso la cuarentena se pide explicitamente y el fallo NO aborta:
+                        # en la rama interna la unidad ya esta cuarentenada y Mintsoft va a
+                        # rechazar el movimiento, y ahi el transfer de abajo funciona igual.
+
+                        temporary_location_id = config.location_id(
+                            warehouse, buen_estado=False
+                        )
+
+                        reallocation_data = {
+                            "SourceWarehouseId": warehouse,
+                            "SourceNameOrCode": config.SOURCE_QUARANTINE,
+                            "DestinationWarehouseId": warehouse,
+                            "DestinationNameOrCode": carton_code,
+                            "ProductId": product_id,
+                            "Quantity": item.get("quantity"),
+                            "Type": "Quarantine",
+                            "Comment": "Return reallocation",
+                        }
+
+                        # La caja se crea en RET, no en RET-TEMP. El por qué está en
+                        # _asegurar_caja.
+                        self._asegurar_caja(carton_code, warehouse, client_id)
+
+                        try:
+                            self.client.quarantine_stock({
+                                # "ProductId", no "ProductID": es la grafia que usan
+                                # TransferStock, AddItem y CreateExternalReturn en toda la
+                                # API. Con "ProductID" el producto no bindeaba y Mintsoft
+                                # contestaba "Unable to Quarantine stock as not enough could
+                                # be found in the selected location!", que se leyo como "ya
+                                # estaba cuarentenado" cuando era un nombre de campo mal
+                                # escrito.
+                                "ProductId": product_id,
+                                "WarehouseId": warehouse,
+                                "LocationId": temporary_location_id,
+                                "Quantity": item.get("quantity"),
+                                "Comment": "Returned stock sent to Quarantine",
+                            }, timeout=25)
+                            self.logger.info(
+                                f"{sku}: cuarentenado en RET-TEMP. Reubicando a la caja {carton_code}."
+                            )
+                        except Exception as qt_err:
+                            # No aborta: en la rama interna la unidad ya viene cuarentenada
+                            # por el confirm y este movimiento se rechaza, pero el transfer
+                            # de abajo si funciona. Si el transfer tambien falla, ese si
+                            # lanza y se reporta con el mail de error.
+                            self.logger.warning(
+                                f"{sku}: no se pudo cuarentenar en RET-TEMP ({qt_err}). "
+                                f"Si el return es interno la unidad ya estaba cuarentenada; "
+                                f"se intenta el transfer a {carton_code} igual."
+                            )
+
+                        response = self._transfer_stock_resiliente(
+                            reallocation_data, sku, client_id, stock_cache
+                        )
+                        responses.append(response)
+                        self.logger.info(f"{sku}: transfer a {carton_code!r} -> {response}")
+                except Exception as item_err:
+                    self.logger.error(
+                        f"{sku}: fallo la reubicacion de stock ({item_err}). Se "
+                        f"sigue con los demas items.",
+                        exc_info=True,
+                    )
+                    fallados.append({
+                        "sku": str(sku),
+                        "error": f"{type(item_err).__name__}: {item_err}",
+                    })
                     continue
 
-                disposition = item.get("disposition")
-                if config.es_buen_estado(disposition): # Stock en buenas condiciones
-
-                    reallocation_data = {
-                        "SourceWarehouseId": warehouse,
-                        "SourceNameOrCode": config.SOURCE_GOOD,
-                        "DestinationWarehouseId": warehouse,
-                        "DestinationNameOrCode": carton_code,
-                        "ProductId": product_id,
-                        "Quantity": item.get("quantity"),
-                        "Comment": "Return reallocation",
-                    }
-
-                    self._asegurar_caja(carton_code, warehouse, client_id)
-
-                    response = self._transfer_stock_resiliente(
-                        reallocation_data, sku, client_id, stock_cache
+            # Se lanza DESPUES de recorrer todos los items, no en el primer
+            # problema: asi el mail lista todo lo que quedo sin reubicar y el
+            # resto del return si se procesa.
+            if sin_caja or fallados:
+                partes = []
+                if sin_caja:
+                    partes.append(
+                        f"sin put_away_bin ({', '.join(sin_caja)})"
                     )
-                    responses.append(response)
-                    self.logger.info(f"{sku}: transfer a {carton_code!r} -> {response}")
-
-                else: # Stock a mandar a cuarentena
-
-                    # El TransferStock de abajo lleva Type='Quarantine', asi que solo
-                    # mueve stock YA cuarentenado. Que la unidad llegue cuarentenada a
-                    # RET-TEMP depende de la rama, y no es igual en las dos:
-                    #
-                    #  - Return INTERNO: add_return_items alloca el item a RET-TEMP y
-                    #    DESPUES confirma, asi que el StockAction='Quarantine' de
-                    #    ReturnReasonId=2 cae sobre la unidad ya ubicada y la deja en
-                    #    RET-TEMP con Type='Quarantine'. Acá el transfer funciona.
-                    #
-                    #  - Return EXTERNO: CreateExternalReturn crea el return YA
-                    #    confirmado, o sea que la cuarentena se aplica ANTES de que el
-                    #    item tenga ubicacion. Recien despues AllocateItemLocation lo
-                    #    deja en RET-TEMP, y lo deja como Type='Allocation'. El segundo
-                    #    confirm_return no re-aplica nada porque ya estaba confirmado.
-                    #    Resultado: no hay stock cuarentenado en RET-TEMP y el transfer
-                    #    falla con "Could not find any of product ID: X in RET-TEMP!".
-                    #
-                    # Verificado con el return de tracking 9434636208303429481960
-                    # (SKU W836-2-Chocolate-6, disposition 'Exception', Bronze Snake):
-                    # quedo en RET-TEMP con Type='Allocation' y sin caja asociada.
-                    #
-                    # Por eso la cuarentena se pide explicitamente y el fallo NO aborta:
-                    # en la rama interna la unidad ya esta cuarentenada y Mintsoft va a
-                    # rechazar el movimiento, y ahi el transfer de abajo funciona igual.
-
-                    temporary_location_id = config.location_id(
-                        warehouse, buen_estado=False
+                if fallados:
+                    partes.append(
+                        "con error ("
+                        + "; ".join(f"{f['sku']}: {f['error']}" for f in fallados)
+                        + ")"
                     )
-
-                    reallocation_data = {
-                        "SourceWarehouseId": warehouse,
-                        "SourceNameOrCode": config.SOURCE_QUARANTINE,
-                        "DestinationWarehouseId": warehouse,
-                        "DestinationNameOrCode": carton_code,
-                        "ProductId": product_id,
-                        "Quantity": item.get("quantity"),
-                        "Type": "Quarantine",
-                        "Comment": "Return reallocation",
-                    }
-
-                    # La caja se crea en RET, no en RET-TEMP. El por qué está en
-                    # _asegurar_caja.
-                    self._asegurar_caja(carton_code, warehouse, client_id)
-
-                    try:
-                        self.client.quarantine_stock({
-                            # "ProductId", no "ProductID": es la grafia que usan
-                            # TransferStock, AddItem y CreateExternalReturn en toda la
-                            # API. Con "ProductID" el producto no bindeaba y Mintsoft
-                            # contestaba "Unable to Quarantine stock as not enough could
-                            # be found in the selected location!", que se leyo como "ya
-                            # estaba cuarentenado" cuando era un nombre de campo mal
-                            # escrito.
-                            "ProductId": product_id,
-                            "WarehouseId": warehouse,
-                            "LocationId": temporary_location_id,
-                            "Quantity": item.get("quantity"),
-                            "Comment": "Returned stock sent to Quarantine",
-                        }, timeout=25)
-                        self.logger.info(
-                            f"{sku}: cuarentenado en RET-TEMP. Reubicando a la caja {carton_code}."
-                        )
-                    except Exception as qt_err:
-                        # No aborta: en la rama interna la unidad ya viene cuarentenada
-                        # por el confirm y este movimiento se rechaza, pero el transfer
-                        # de abajo si funciona. Si el transfer tambien falla, ese si
-                        # lanza y se reporta con el mail de error.
-                        self.logger.warning(
-                            f"{sku}: no se pudo cuarentenar en RET-TEMP ({qt_err}). "
-                            f"Si el return es interno la unidad ya estaba cuarentenada; "
-                            f"se intenta el transfer a {carton_code} igual."
-                        )
-
-                    response = self._transfer_stock_resiliente(
-                        reallocation_data, sku, client_id, stock_cache
-                    )
-                    responses.append(response)
-                    self.logger.info(f"{sku}: transfer a {carton_code!r} -> {response}")
-
-            if sin_caja:
                 raise RuntimeError(
-                    f"Items sin put_away_bin, no se les pudo reubicar el stock: "
-                    f"{', '.join(sin_caja)}"
+                    "Items cuyo stock NO se reubico -- " + " | ".join(partes)
                 )
 
             if faltantes:
@@ -1345,22 +1436,36 @@ class MintsoftReturnService:
             # Nada de recalcular el identificador a mano acá: line_items[0] con lista
             # vacía o un customer ausente lanzaban DENTRO del handler y el error real
             # quedaba tapado por el del propio handler.
+            # El mail nombra TODOS los items que quedaron sin reubicar, separando
+            # los dos motivos: sin put_away_bin (no hay caja destino) y los que
+            # fallaron contra Mintsoft. Antes solo podia nombrar los primeros,
+            # porque el loop cortaba en el primer error y no sabia que mas faltaba.
+            pendientes = list(sin_caja) + [f["sku"] for f in fallados]
+            detalles = []
+            if sin_caja:
+                detalles.append(
+                    f"{len(sin_caja)} sin put_away_bin ({', '.join(sin_caja)})"
+                )
+            if fallados:
+                detalles.append(f"{len(fallados)} con error de Mintsoft")
+
             self._send_error_email(
                 method="reallocate_return_items",
                 error=e,
                 order_reference=self._return_identifier(data),
-                sku=", ".join(sin_caja) if sin_caja else None,
+                sku=", ".join(pendientes) if pendientes else None,
                 que_falta=(
-                    f"{len(sin_caja)} item(s) sin put_away_bin: el stock quedo en "
-                    f"RET / RET-TEMP y no se movio a ninguna caja"
-                    if sin_caja else
+                    f"{len(pendientes)} item(s) con el stock sin mover "
+                    f"({'; '.join(detalles)}): quedo en RET / RET-TEMP"
+                    if pendientes else
                     "El stock quedo en RET / RET-TEMP, sin mover a la caja del operario"
                 ),
                 accion=(
-                    f"Mover a mano el stock de {', '.join(sin_caja)} desde RET / RET-TEMP "
-                    f"a la caja fisica que corresponda. El return SI esta creado y "
-                    f"confirmado; lo que falta es el movimiento de stock."
-                    if sin_caja else
+                    f"Mover a mano el stock de {', '.join(pendientes)} desde "
+                    f"RET / RET-TEMP a la caja fisica que corresponda. El return SI "
+                    f"esta creado y confirmado; lo que falta es el movimiento de "
+                    f"stock. Los demas items del return SI se movieron."
+                    if pendientes else
                     "Mover a mano el stock desde RET / RET-TEMP a la caja del "
                     "put_away_bin. El return SI esta creado y confirmado; lo que falta "
                     "es el movimiento de stock."
@@ -1370,6 +1475,8 @@ class MintsoftReturnService:
                     "client_id": client_id,
                     "items_reasignados": len(responses),
                     "items_en_el_payload": len(line_items),
+                    "items_sin_caja": sin_caja,
+                    "items_fallados": fallados,
                 },
             )
             raise

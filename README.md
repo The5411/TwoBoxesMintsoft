@@ -121,7 +121,8 @@ storage/
 loggers/
   main_logger.py                  Factory de logger a stdout
 models/                           Payloads de ejemplo capturados y datos de referencia de Mintsoft (ver abajo)
-tests/                            79 tests (pytest). Corren en CI, sin tocar la red.
+tests/                            107 tests (pytest). Corren en CI, sin tocar la red:
+                                  un guard de sockets lo hace cumplir.
 .github/workflows/ci.yml          Compila todo + corre los tests en cada push y PR
 ```
 
@@ -748,16 +749,27 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
    `PICKING TOTE`, `CROSSDOCK`, `PACKING`. La cuarentena es un **estado del stock**
    (`Type='Quarantine'` / `InQuarantine`), y convive con ubicación y caja: una unidad puede estar
    en cuarentena dentro de una caja en `RET`.
-7. **`get_product_id` se llama repetidamente** para el mismo SKU en `create_return`,
-   `add_return_items` (dos veces) y `reallocate_return_items` — sin ningún cacheo.
-8. **`get_product_id` arma una URL con doble slash** (`…co.uk//api/Product/Search`), que
-   Mintsoft acepta igual.
-9. **`reallocate_return_items` acumula las respuestas en una lista** y la devuelve. Antes
-   devolvía la variable `response` del último item del loop, así que lanzaba
-   `UnboundLocalError` cuando no se procesaba ningún item (`line_items` vacío, o todos salteados
-   por no traer `put_away_bin`). Sigue re-lanzando las excepciones, mientras que
-   `add_return_items` las absorbe — o sea que un fallo en un item **aborta la reasignación de los
-   items siguientes** y ese stock queda en `RET` / `RET-TEMP`.
+7. **`get_product_id` se cachea por webhook.** Los tres pasos (`create_return`,
+   `add_return_items` y `reallocate_return_items`) resuelven el SKU por
+   `_resolver_product_id`, que guarda el resultado en un cache thread-local con alcance de
+   un solo webhook. Antes el mismo SKU se consultaba hasta tres veces, y cada resolución son
+   una o dos llamadas HTTP — dos si hay que caer al fallback por barcode. El cache es
+   thread-local a propósito: el service es único y lo comparten los threads del pool, así
+   que un cache de instancia mezclaría clientes distintos. Solo se cachean las resoluciones
+   exitosas, para que un `None` de una llamada con `crear_si_falta=False` no impida el alta
+   después.
+8. **`get_product_id` usa `params=`, no interpolación.** Ya no arma la URL a mano (antes
+   quedaba con doble slash, `…co.uk//api/Product/Search`) y los SKUs o nombres con `&` y
+   espacios — la tabla de clientes tiene `staple & hue` — ya no rompen el querystring.
+9. **`reallocate_return_items` ya no corta en el primer item que falla.** Cada item se
+   procesa dentro de su propio `try`; los que fallan se juntan y se reportan todos al final,
+   igual que hace `add_return_items` con sus items caídos. Antes el loop re-lanzaba en el
+   primer error, así que **el stock de todos los items siguientes quedaba en `RET` /
+   `RET-TEMP` sin que el mail dijera cuáles**. Ahora el mail lista todo lo que quedó sin
+   mover, separando los dos motivos (sin `put_away_bin` vs. error de Mintsoft), y aclara que
+   los demás items sí se movieron. También acumula las respuestas en una lista: antes
+   devolvía el `response` del último item del loop y lanzaba `UnboundLocalError` cuando no se
+   procesaba ninguno.
 10. **`allocate_external_return_items` sobreescribe el parámetro `data`** dentro de su loop; el
     manejador de errores se protege de eso con un chequeo de `isinstance` / `"event_data" in data`.
 11. **Los manejadores de error ya no recalculan el identificador a mano.** Los cuatro usan
@@ -801,9 +813,12 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
     significa que la key expiró y que el request no llegó a ejecutarse del lado de Mintsoft, así
     que reintentarlo no puede duplicar nada. De paso, si Mintsoft está caída la aplicación
     igual levanta: antes el worker moría en el import.
-19. **`create_product` no envía `Weight`**, que el schema `Product` marca como requerido junto
-    con `SKU`. Se mandan solo SKU, Name, EAN y ClientId, así que crear un SKU al vuelo durante un
-    return externo puede volver con `Success: false`. **Pendiente.**
+19. **`create_product` ya envía `Weight`**, que el schema `Product` marca como requerido
+    junto con `SKU`. Antes se mandaban solo SKU, Name, EAN y ClientId, así que un alta al
+    vuelo durante un return externo podía volver con `Success: false` sin que el motivo fuera
+    evidente. El valor sale de `PRODUCT_DEFAULT_WEIGHT` (default `0`) y es un **placeholder
+    deliberado, no una medición**: el payload de Two Boxes no trae el peso. El alta se loguea
+    como `WARNING` diciendo que hay que completar la ficha del producto a mano.
 20. **El merchant se busca en tres lugares.** `event_data['merchant_integration']['merchant']`
     (que no existe en estos payloads), `event_data['line_items'][0]['merchant']` y
     `event_data['merchant']`. Antes solo se miraban los dos primeros, así que cualquier evento

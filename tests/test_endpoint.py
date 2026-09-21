@@ -1,7 +1,7 @@
 """Contrato del endpoint: auth, filtrado por tipo, duplicados y PII."""
 import pytest
 
-from conftest import ClienteFalso, item, payload
+from conftest import ClienteFalso, item, payload, procesar_en_background
 import listener
 
 
@@ -43,10 +43,7 @@ def test_payload_deforme_sigue_devolviendo_200(cliente_http, cuerpo):
 def test_event_type_no_soportado_no_llega_a_mintsoft(cliente_http):
     cli = ClienteFalso()
     listener.return_service.client = cli
-    cliente_http.post("/webhook", json=payload(event_type="return-created"), headers=AUTH)
-    listener.executor.shutdown(wait=True)
-    import concurrent.futures
-    listener.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    procesar_en_background(payload(event_type="return-created"))
     assert cli.llamadas == [], "un tipo no soportado no puede escribir en el WMS"
 
 
@@ -55,10 +52,7 @@ def test_mismo_event_id_dos_veces_procesa_una_sola(cliente_http):
     cli = ClienteFalso()
     listener.return_service.client = cli
     for _ in range(2):
-        cliente_http.post("/webhook", json=payload(event_id="evt-repetido"), headers=AUTH)
-    listener.executor.shutdown(wait=True)
-    import concurrent.futures
-    listener.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        procesar_en_background(payload(event_id="evt-repetido"))
     assert len(cli.hizo("create_return")) == 1, "el segundo envio no debe crear otro return"
 
 

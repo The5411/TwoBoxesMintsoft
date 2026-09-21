@@ -1,19 +1,14 @@
 """Que casos avisan por mail, cuales no, y que el throttle no inunde."""
-import concurrent.futures
 import pytest
 
-from conftest import ClienteFalso, item, payload
+from conftest import ClienteFalso, item, payload, procesar_en_background
 import listener
 
 AUTH = {"x-two-boxes-authorization": "test-secret"}
 
-
-def postear(cuerpo):
-    http = listener.app.test_client()
-    r = http.post("/webhook", json=cuerpo, headers=AUTH)
-    listener.executor.shutdown(wait=True)
-    listener.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-    return r
+# Drena los DOS pools. Antes esta funcion apagaba solo `executor` y dejaba las
+# tareas de archivado corriendo despues del test.
+postear = procesar_en_background
 
 
 def test_COR26_event_type_no_soportado_avisa_y_no_escribe(mails):

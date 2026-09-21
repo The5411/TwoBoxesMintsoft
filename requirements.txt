@@ -6,7 +6,11 @@ python-dotenv==1.0.1
 # dependencia transitiva de requests, asi que va declarada.
 urllib3==2.2.3
 # Driver de Postgres para el store de eventos (storage/event_store.py). Solo se
-# importa si DATABASE_URL esta seteada; sin ella el store usa sqlite3 (stdlib),
-# asi que en desarrollo y en CI esta dependencia no se toca. La variante
-# [binary] trae wheels precompilados: no requiere libpq ni compilador.
-psycopg[binary]==3.2.3
+# importa si DATABASE_URL esta seteada; sin ella el store usa sqlite3 (stdlib).
+# La variante [binary] trae wheels precompilados: no requiere libpq ni compilador.
+#
+# Rango en vez de pin exacto, a diferencia del resto: psycopg-binary publica un
+# wheel por version de Python, y fijar una version puntual rompe el build cuando
+# esa version todavia no tiene wheel para el interprete del runner. El techo en
+# <4 acota el riesgo de un cambio incompatible.
+psycopg[binary]>=3.2.3,<4

@@ -8,6 +8,31 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Postgres es el backend del store de eventos en produccion
+    # (storage/event_store.py). Sin este servicio los tests solo ejercitaban
+    # SQLite, asi que una divergencia entre los dos backends -- la SQL es la misma
+    # salvo el placeholder -- no se veia hasta el deploy.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_store
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # tests/test_store_backends.py corre el mismo contrato contra los dos
+      # backends. Sin esta variable, los casos de Postgres quedan skipped.
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_store
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,5 +43,17 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - name: Compilar todo (detecta SyntaxError antes del deploy)
         run: python -m compileall -q listener.py config.py clients services mappers loggers storage
+      - name: Verificar que el driver de Postgres este disponible
+        # Si esto falla, los tests de Postgres quedarian skipped en silencio y
+        # creeriamos que ese backend esta cubierto cuando no lo esta.
+        run: python -c "import psycopg; print('psycopg', psycopg.__version__)"
       - name: Tests
         run: python -m pytest tests/ -q
+      - name: Confirmar que los tests de Postgres NO quedaron skipped
+        # El contrato del store tiene que haber corrido contra los dos backends.
+        run: |
+          python -m pytest tests/test_store_backends.py -q -rs 2>&1 | tee /tmp/backends.txt
+          if grep -q "skipped" /tmp/backends.txt; then
+            echo "::error::Los tests de Postgres quedaron skipped: TEST_DATABASE_URL no llego al runner"
+            exit 1
+          fi

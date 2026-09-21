@@ -1,4 +1,10 @@
-"""Arnes de tests. No toca la red: Mintsoft, SMTP y Google estan stubeados."""
+"""Arnes de tests.
+
+No toca la red, y esta hecho cumplir: `red_bloqueada` hace fallar cualquier
+conexion que no sea loopback, asi que un camino nuevo sin stub es un error
+ruidoso en vez de una llamada real a produccion. Mintsoft, SMTP y Google estan
+stubeados; el Postgres de CI corre en localhost, que si esta permitido.
+"""
 import os
 import sys
 import smtplib
@@ -28,7 +34,51 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def sin_red(monkeypatch):
+def red_bloqueada(monkeypatch):
+    """Hace fallar cualquier conexion de red real, en vez de dejarla colgar.
+
+    Los stubs de `sin_red` cubren los caminos conocidos, pero un camino nuevo --
+    o una tarea que sobreviva al teardown -- salia a internet de verdad: la suite
+    llego a colgarse 30 segundos posteando a la GAS_URL de produccion con los
+    retries y el timeout de 120s. Con esto, eso es un error inmediato y ruidoso.
+
+    Va en su propio fixture, y antes de `sin_red` en el orden de resolucion, para
+    que tambien cubra el armado de los stubs.
+    """
+    import socket
+
+    # Loopback si: es donde corre el Postgres de CI, que los tests de
+    # tests/test_store_backends.py necesitan de verdad. Todo lo demas -- Mintsoft,
+    # Google, SMTP -- tiene que estar stubeado.
+    LOOPBACK = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+    connect_real = socket.socket.connect
+    connect_ex_real = socket.socket.connect_ex
+
+    def es_loopback(direccion):
+        if isinstance(direccion, (tuple, list)) and direccion:
+            return str(direccion[0]) in LOOPBACK
+        # Los sockets unix (AF_UNIX) son una ruta local: tampoco salen a la red.
+        return isinstance(direccion, (str, bytes))
+
+    def guardia(real, nombre):
+        def envoltorio(self, direccion, *a, **k):
+            if es_loopback(direccion):
+                return real(self, direccion, *a, **k)
+            raise AssertionError(
+                f"Los tests no pueden salir a la red ({nombre} a {direccion!r}). "
+                f"Si un camino nuevo necesita HTTP, stubealo en conftest.py."
+            )
+        return envoltorio
+
+    monkeypatch.setattr(socket.socket, "connect", guardia(connect_real, "connect"))
+    monkeypatch.setattr(
+        socket.socket, "connect_ex", guardia(connect_ex_real, "connect_ex")
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def sin_red(monkeypatch, red_bloqueada):
     """Corta toda salida a la red y captura los mails."""
     enviados = []
 
@@ -65,35 +115,68 @@ def sin_red(monkeypatch):
     })
     monkeypatch.setattr(listener.session, "post", lambda *a, **k: respuesta_ok())
     monkeypatch.setattr(listener.requests, "post", lambda *a, **k: respuesta_ok())
-    listener.MAILS = enviados
+    # Las URLs de Google se neutralizan a nivel de modulo: conftest las saca del
+    # entorno, pero listener.py llama a load_dotenv() al importarse y las vuelve a
+    # cargar desde .env -- que en una maquina de desarrollo tiene las de
+    # PRODUCCION. Con esto, incluso una llamada que se escape no sale a la red.
+    monkeypatch.setattr(listener, "GAS_URL", None)
+    monkeypatch.setattr(listener, "WEBHOOKS_URL", None)
+
     yield enviados
+
+    # Drenar los DOS pools antes de que monkeypatch deshaga los stubs.
+    #
+    # Sin esto, un test que solo esperaba `executor` dejaba tareas de archivado
+    # encoladas en `archivo_executor`. Esas tareas corrian DESPUES del teardown,
+    # ya sin los stubs, asi que llamaban al requests.post de verdad contra la
+    # GAS_URL real: la suite hacia red y se colgaba hasta 30 segundos por los
+    # retries y el timeout de 120s. monkeypatch se deshace despues de este
+    # fixture (lo pide `sin_red`), asi que aca los stubs todavia estan puestos.
+    drenar_pools()
 
 
 def limpiar_store(store):
-    """Borra todas las filas del store. Los tests comparten el archivo."""
-    con = store._conectar()
-    try:
-        con.cursor().execute("DELETE FROM webhook_events")
-        con.commit()
-    finally:
-        con.close()
+    """Borra todas las filas del store. Los tests comparten el archivo.
+
+    Toma el mismo lock que usa el store: sin eso, si quedara una conexion
+    abierta de un thread anterior, esta esperaria el busy_timeout de 15s de
+    SQLite antes de fallar.
+    """
+    with store._lock:
+        con = store._conectar()
+        try:
+            con.cursor().execute("DELETE FROM webhook_events")
+            con.commit()
+        finally:
+            con.close()
+
+
+def drenar_pools():
+    """Espera a que terminen los dos pools y los reemplaza.
+
+    Hay que reemplazarlos porque un ThreadPoolExecutor apagado no acepta mas
+    trabajo. Es lo unico que garantiza que no quede una tarea corriendo despues
+    del test que la encolo.
+    """
+    import concurrent.futures
+    import listener
+
+    for nombre in ("executor", "archivo_executor"):
+        getattr(listener, nombre).shutdown(wait=True)
+        setattr(listener, nombre, concurrent.futures.ThreadPoolExecutor(max_workers=4))
 
 
 def procesar_en_background(cuerpo, headers=None):
     """Postea a /webhook y espera a que los dos pools terminen.
 
-    Devuelve la respuesta HTTP. Reemplaza los pools despues de esperarlos,
-    porque un ThreadPoolExecutor apagado no acepta mas trabajo.
+    Devuelve la respuesta HTTP.
     """
-    import concurrent.futures
     import listener
 
     http = listener.app.test_client()
     r = http.post("/webhook", json=cuerpo,
                   headers=headers or {"x-two-boxes-authorization": "test-secret"})
-    for nombre in ("executor", "archivo_executor"):
-        getattr(listener, nombre).shutdown(wait=True)
-        setattr(listener, nombre, concurrent.futures.ThreadPoolExecutor(max_workers=4))
+    drenar_pools()
     return r
 
 
