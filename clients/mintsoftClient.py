@@ -437,7 +437,7 @@ class MintsoftOrderClient:
         # "TypeError: object of type 'NoneType' has no len()" y el item se perdia.
         barcode = str(barcode).strip() if barcode is not None else ""
 
-        if product_id == None and len(barcode) > 7:
+        if product_id == None:
             sku_rety = self.get_sku_dado_barcode(barcode)
             # Sku ret
             if sku_rety == "null":

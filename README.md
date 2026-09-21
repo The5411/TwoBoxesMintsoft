@@ -374,19 +374,11 @@ payloads de RMA el barcode de nivel item viene siempre `null`** y el real está 
 `product_variant` (ver `models/tb_rma_model.json`).
 
 ```python
-if product_id == None and len(barcode) > 7:
+if product_id == None:
     sku_rety = self.get_sku_dado_barcode(barcode)
     if sku_rety == "null":
         return sku, None
 ```
-
-**Por qué el `len(barcode) > 7`.** Es una limitación del endpoint `SearchBarcode` de Mintsoft:
-con barcodes cortos (7 caracteres o menos) el endpoint no se comporta como una búsqueda exacta
-y devuelve matches por prefijo/parcial, es decir el SKU de **otro** producto. Un SKU equivocado
-es peor que ningún SKU: el return se crearía contra un producto real distinto y el stock
-devuelto quedaría sumado en el lugar equivocado, sin ningún error visible. Por eso el guard
-corta antes de llamar al endpoint y el fallback solo se intenta cuando el barcode es lo bastante
-largo para que la búsqueda sea confiable (EAN-13, UPC-A, etc.).
 
 **Qué pasa con los casos que caen acá.** Si el barcode tiene 7 caracteres o menos, `get_product_id`
 devuelve `(sku, None)` sin intentar el fallback, y el flujo sigue con `product_id = None`:
