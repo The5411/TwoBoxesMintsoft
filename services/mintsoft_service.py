@@ -8,12 +8,12 @@ import traceback
 from email.message import EmailMessage
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import config
 from loggers.main_logger import get_logger
 from clients.mintsoftClient import MintsoftOrderClient
 from mappers.mintsoft_mapper import map_client, map_warehouse
@@ -49,14 +49,8 @@ def _order_number_variants(value) -> List[str]:
 
 
 def _is_missing(item) -> bool:
-    """True si el item nunca llegó físicamente al depósito.
-
-    Two Boxes lo marca con disposition='Missing': el cliente declaró la devolución
-    pero la unidad no apareció. No hay nada que dar de alta en Mintsoft, nada que
-    ubicar, y -- importante -- no corresponde reclamarle `put_away_bin`, porque no
-    hay unidad que guardar en ninguna caja.
-    """
-    return str((item or {}).get("disposition") or "").strip() == "Missing"
+    """True si el item nunca llegó físicamente al depósito. Ver config.es_missing."""
+    return config.es_missing(item)
 
 
 def _get_item_barcode(item) -> Optional[str]:
@@ -77,14 +71,13 @@ class MintsoftReturnService:
     def __init__(self, logger_name: str = "mintsoft_service", log_file: str = "m_service.log"):
         self.logger = get_logger(logger_name, log_file)
         self.client = MintsoftOrderClient()
-        # Estados en los que una orden ya salió del depósito y por lo tanto se
-        # le puede crear un return: 4=DESPATCHED, 5=INVOICED, 6=INVOICEFAILED.
-        # Configurable porque son ids de Mintsoft: si cambian o hace falta sumar
-        # uno, no deberia requerir un deploy.
-        self.returnable_status_ids = {
-            int(x) for x in os.environ.get("RETURNABLE_ORDER_STATUS_IDS", "4,5,6").split(",")
-            if x.strip()
-        }
+        # Estados que habilitan un return interno (4=DESPATCHED, 5=INVOICED,
+        # 6=INVOICEFAILED). Vive en config.py con el resto de los ids de Mintsoft.
+        self.returnable_status_ids = config.RETURNABLE_ORDER_STATUS_IDS
+
+        # Store de eventos. Lo inyecta el listener; si queda en None el service
+        # funciona igual pero sin la proteccion contra reprocesos (E-1).
+        self.store = None
 
         # ----- Email notification config (read from environment) -----
         self.smtp_host = os.environ.get("SMTP_HOST")
@@ -114,9 +107,15 @@ class MintsoftReturnService:
     # excepcion, reallocate_return_items, y el catch-all). Ahora los problemas se
     # acumulan durante el procesamiento y se manda uno solo al final.
     # -------------------------------------------------------------
-    def begin_webhook_report(self, data) -> None:
-        """Abre el reporte del webhook. Idempotente si ya hay uno abierto."""
+    def begin_webhook_report(self, data, event_key: Optional[str] = None) -> None:
+        """Abre el reporte del webhook. Idempotente si ya hay uno abierto.
+
+        `event_key` es la clave de idempotencia del evento en el store. Se guarda
+        acá para que create_return pueda grabar el return_id en cuanto Mintsoft lo
+        devuelve, sin tener que pasarlo por la firma de cada método.
+        """
         self._reporte.problemas = []
+        self._reporte.event_key = event_key
         try:
             self._reporte.referencia = self._return_identifier(data)
         except Exception:
@@ -469,6 +468,127 @@ class MintsoftReturnService:
             "NoOp": True,
         }
 
+    # -------------------------------------------------------------
+    # Helpers compartidos por los dos caminos (interno y externo). Antes cada
+    # rama resolvía por su cuenta la location, el return reason y el ProductId,
+    # con los ids escritos a mano en cinco bloques distintos.
+    # -------------------------------------------------------------
+    def _location_de(self, warehouse, item) -> int:
+        """LocationId de returns para este item: RET si vuelve vendible, RET-TEMP
+        si va a cuarentena. Lanza config.LocationDesconocida si el warehouse no
+        está configurado, en vez de caer en silencio a las locations de E-Commerce.
+        """
+        return config.location_id(
+            warehouse, buen_estado=config.es_buen_estado((item or {}).get("disposition"))
+        )
+
+    def _event_key(self) -> Optional[str]:
+        return getattr(self._reporte, "event_key", None)
+
+    def _registrar_return(self, return_id, kind: str) -> None:
+        """Graba en el store el return que Mintsoft acaba de crear.
+
+        Se llama ANTES de agregar items o mover stock: es la marca que impide que
+        un reproceso posterior cree un segundo return con el mismo stock (el caso
+        de la orden W836). Si no se puede grabar, el webhook sigue -- el return ya
+        existe -- pero queda un problema en el reporte, porque el evento perdió la
+        protección.
+        """
+        event_key = self._event_key()
+        if not (self.store and event_key and return_id is not None):
+            return
+        if self.store.record_return(event_key, return_id, kind):
+            self.logger.info(
+                f"Return {return_id} ({kind}) registrado en el store para "
+                f"event_key={event_key}"
+            )
+            return
+        self.logger.error(
+            f"No se pudo registrar el return {return_id} en el store: el evento "
+            f"{event_key} quedó sin proteccion contra reprocesos."
+        )
+        self._send_error_email(
+            method="_registrar_return",
+            error=RuntimeError(
+                f"El return {return_id} se creo en Mintsoft pero no se pudo grabar "
+                f"en la base de idempotencia"
+            ),
+            que_falta=(
+                f"El return {return_id} existe en Mintsoft pero NO quedó registrado "
+                f"en la base"
+            ),
+            accion=(
+                "NO reprocesar este webhook: al no estar registrado, un reproceso "
+                f"crearía un segundo return. Completar el return {return_id} a mano."
+            ),
+            context={"return_id": return_id, "kind": kind, "event_key": event_key},
+        )
+
+    def _resolver_product_id(self, item, client_id, *, crear_si_falta: bool):
+        """(sku, product_id) para un line item, dando de alta el SKU si hace falta.
+
+        Unifica lo que las dos ramas hacían por separado: la externa creaba el
+        producto y la interna se limitaba a descartar el item. Devuelve
+        product_id=None si no se pudo resolver y `crear_si_falta` es False.
+        """
+        sku = (item or {}).get("sku")
+        barcode = _get_item_barcode(item)
+        sku, product_id = self.client.get_product_id(sku, client_id, barcode)
+
+        if product_id is not None or not crear_si_falta:
+            return sku, product_id
+
+        # El SKU no existe en Mintsoft: se da de alta.
+        nuevo = {
+            "SKU": sku,
+            "Name": ((item or {}).get("product_variant") or {}).get("name") or (item or {}).get("sku"),
+            "EAN": barcode,
+            "ClientId": client_id,
+        }
+        product_id = self.client.create_product(nuevo)
+        if product_id is None:
+            # Mintsoft rechaza el CreateExternalReturn entero si un item viene con
+            # ProductId null, pero el mensaje que devuelve no dice cual fue. Fallar
+            # acá nombra el SKU: mismo resultado, diagnóstico útil.
+            raise RuntimeError(
+                f"No se pudo crear el producto {sku!r} en Mintsoft, asi que el item "
+                f"no tiene ProductId. El return no se crea: hay que dar de alta el "
+                f"SKU a mano."
+            )
+        # Sleep corto para no saturar la API despues de un alta.
+        time.sleep(3)
+        return sku, product_id
+
+    def _asegurar_caja(self, carton_code, warehouse, client_id) -> None:
+        """Crea la caja destino si Mintsoft no la conoce.
+
+        La caja se crea SIEMPRE en RET, nunca en RET-TEMP, por dos razones:
+
+          1. Es donde tiene que quedar la mercadería: RET-TEMP es la location
+             transitoria de aislamiento, no un destino.
+          2. Si la caja vive en RET-TEMP -- la misma location a la que el confirm
+             alloca el item -- y ya contiene ese SKU, Mintsoft consolida la unidad
+             nueva adentro de la caja y no queda nada suelto. Después el
+             TransferStock falla con "Could not find any of product ID: X in
+             RET-TEMP!". Con la caja en RET eso no pasa.
+
+        El transfer sigue saliendo de RET-TEMP cuando corresponde: el destino es el
+        código de caja, y Mintsoft arrastra la unidad a la location de la caja
+        conservando Type='Quarantine'.
+        """
+        if self.client.check_carton(carton_code):
+            return
+        self.logger.info(f"Caja {carton_code!r} no esta en Mintsoft: se crea.")
+        self.client.create_carton(
+            {
+                "WarehouseId": warehouse,
+                "StorageMediaName": "Stock",
+                "Code": carton_code,
+                "LocationId": config.location_id(warehouse, buen_estado=True),
+            },
+            client_id,
+        )
+
     def _get_merchant_name(self, data) -> str:
         """Nombre del merchant, buscándolo en los tres lugares donde puede venir.
 
@@ -642,8 +762,11 @@ class MintsoftReturnService:
             warehouse = map_warehouse(merchant_name)
 
             if client_id is None:
-                    print ("Client not in Mintsoft, return cannot be processed")
-                    return None, "No Return Created"
+                self.logger.error(
+                    f"Merchant {merchant_name!r} no esta en la tabla de clientes: "
+                    f"no se puede procesar el return. (map_client ya avisó por mail.)"
+                )
+                return None, "No Return Created"
 
             # Un return en el que NINGUNA unidad llegó no tiene nada que registrar.
             # Antes se creaba igual: la rama externa armaba ReturnItems=[] (porque
@@ -666,15 +789,16 @@ class MintsoftReturnService:
                 line_items = event_data.get("line_items", [])
                 return_identifier = self._return_identifier(data)
 
-                if len(return_identifier) > 50:
-                    # Mintsoft corta la Reference en 50: si se trunca, el PO reference
+                if len(return_identifier) > config.REFERENCE_MAX_LEN:
+                    # Mintsoft corta la Reference: si se trunca, el PO reference
                     # que se busca despues no es el que se ve en el mail.
                     self.logger.warning(
-                        f"Reference truncada a 50 caracteres: "
-                        f"{return_identifier!r} -> {return_identifier[:50]!r}"
+                        f"Reference truncada a {config.REFERENCE_MAX_LEN} caracteres: "
+                        f"{return_identifier!r} -> "
+                        f"{return_identifier[:config.REFERENCE_MAX_LEN]!r}"
                     )
                 external_return_data = {
-                    "Reference": return_identifier[:50],
+                    "Reference": return_identifier[:config.REFERENCE_MAX_LEN],
                     "ClientId": client_id,
                     "WarehouseId": warehouse,
                     "ReturnItems": [],
@@ -696,53 +820,22 @@ class MintsoftReturnService:
                 commented_tracking_numbers = set()
 
                 for item in line_items:
-                    sku = item.get("sku")
-                    barcode = _get_item_barcode(item)
-                    sku, product_id = self.client.get_product_id(sku, client_id, barcode)
+                    item = item or {}  # un line_item null rompia el loop entero
 
-                    if product_id == None:
-                        # Si el item no existe en Mintsoft con ese SKU
-
-                        new_product_data = {
-                            "SKU": sku,
-                            "Name": (item.get("product_variant") or {}).get("name") or item.get("sku"),
-                            "EAN": barcode,
-                            "ClientId": client_id,
-                        }
-
-                        created_product_id = self.client.create_product(new_product_data)
-                        
-                        # Usamos el ID del item recien creado
-                        product_id = created_product_id
-
-                        if product_id is None:
-                            # Mintsoft rechaza el CreateExternalReturn entero si un
-                            # item viene con ProductId null, pero el mensaje que
-                            # devuelve no dice cual fue. Fallar aca nombra el SKU:
-                            # mismo resultado (no se crea el return), diagnostico util.
-                            raise RuntimeError(
-                                f"No se pudo crear el producto {sku!r} en Mintsoft, "
-                                f"asi que el item no tiene ProductId. El return no se "
-                                f"crea: hay que dar de alta el SKU a mano."
-                            )
-
-                        # Sleep de 3 segundos para no saturar la API
-                        time.sleep(3)
-                        
-                    disposition = item.get("disposition")
-
-                    if disposition == "Return to Stock":
-                        return_reason = 1
-
-                    elif _is_missing(item):
+                    # Missing se chequea ANTES de tocar Mintsoft: la unidad no llegó,
+                    # no hay nada que dar de alta ni que ubicar, y así no se gasta un
+                    # get_product_id (ni un alta de SKU) para un item que se descarta.
+                    if _is_missing(item):
                         self.logger.info(
-                            f"Item {sku} con disposition='Missing': no llegó, no se "
-                            f"agrega al return externo."
+                            f"Item {item.get('sku')} con disposition='Missing': no "
+                            f"llegó, no se agrega al return externo."
                         )
                         continue
 
-                    else:
-                        return_reason = 2
+                    sku, product_id = self._resolver_product_id(
+                        item, client_id, crear_si_falta=True
+                    )
+                    return_reason = config.return_reason_id(item.get("disposition"))
 
                     return_item_data = {
                         "SKU": sku,
@@ -771,6 +864,9 @@ class MintsoftReturnService:
                 external_return_id = self.client.create_external_return(data=external_return_data)
 
                 self.logger.info(f"External return created. ID: {external_return_id}")
+                # Se graba ANTES de ubicar items y mover stock: si algo de eso falla,
+                # un reproceso tiene que ver que el return ya existe.
+                self._registrar_return(external_return_id, "external")
 
                 return external_return_id, "External Return Created" # Crea Return Externa (con el Order ID)
 
@@ -787,15 +883,17 @@ class MintsoftReturnService:
             return_identifier = self._return_identifier(data)
             self.logger.info(
                 f"Order found (ID={order_id}). Creating standard return on WarehouseId={warehouse} "
-                f"(merchant {merchant_name!r}, Reference={return_identifier[:50]!r})."
+                f"(merchant {merchant_name!r}, "
+                f"Reference={return_identifier[:config.REFERENCE_MAX_LEN]!r})."
             )
             return_id = self.client.create_return(
                 order_id,
                 warehouse_id=warehouse,
-                reference=return_identifier[:50],
+                reference=return_identifier[:config.REFERENCE_MAX_LEN],
             )
 
             self.logger.info(f"Created return with ID: {return_id}")
+            self._registrar_return(return_id, "internal")
             return return_id, "Internal Return Created"
 
         except Exception as e:
@@ -832,19 +930,16 @@ class MintsoftReturnService:
             return_items = return_details.get('ReturnItems')
 
             for item in return_items:
-                return_reason = item.get('ReturnReasonId') # 1 es Good Stock, 2 es Quarantine
-                print("return_reason",return_reason)
-                if return_reason == 1: # Si esta en buena condicion
-                    if warehouse == 3:
-                        location_id = 4104 # RET Wholesale
-                    else:
-                        location_id = 4299 # RET E-Commerce
-
-                else: # Si esta en mala condicion
-                    if warehouse == 3:
-                        location_id = 9 # RET-TEMP Wholesale
-                    else:
-                        location_id = 4304 # RET-TEMP E-Commerce
+                # 1 = Good Stock -> RET;  2 = Quarantine -> RET-TEMP.
+                # Los ids de location salen de config.RETURN_LOCATIONS: antes estaban
+                # escritos a mano acá y en otros cuatro bloques.
+                return_reason = item.get('ReturnReasonId')
+                buen_estado = return_reason == config.RETURN_REASON_GOOD
+                location_id = config.location_id(warehouse, buen_estado=buen_estado)
+                self.logger.info(
+                    f"ReturnItem {item.get('ID')}: ReturnReasonId={return_reason} "
+                    f"-> LocationId={location_id}"
+                )
 
                 # Ojo con el nombre: esto se llamaba `data` y pisaba el parametro con
                 # el payload del webhook, asi que el handler de abajo no podia sacar la
@@ -895,6 +990,7 @@ class MintsoftReturnService:
         try:
             merchant_name = self._get_merchant_name(data)
             client_id = map_client(merchant_name) # Si no encuentra devuelve None
+            warehouse = map_warehouse(merchant_name) # 3 si es Wholesale, 5 si es E-Comm
             event_data = data.get("event_data", {})
             line_items = event_data.get("line_items", [])
 
@@ -936,10 +1032,7 @@ class MintsoftReturnService:
                     dropped_items.append({"sku": sku, "motivo": f"{type(e).__name__}: {e}"})
                     continue
 
-                if disposition == "Return to Stock":
-                    return_reason = 1
-                else:
-                    return_reason = 2
+                return_reason = config.return_reason_id(disposition)
 
                 graded_attributes = item.get("graded_attributes") or []
                 return_photos = item.get("photo_urls", [])
@@ -975,14 +1068,10 @@ class MintsoftReturnService:
 
                 return_item_id = response.get("ID")
 
-                # Determinar la ubicación de asignación para ESTE ítem específico
-                merchant = self._get_merchant_name(data)
-                warehouse = map_warehouse(merchant) # 3 si es Wholesale, 5 si es E-Comm
-
-                if disposition == "Return to Stock":
-                    returns_location_id = 4104 if warehouse == 3 else 4299
-                else:
-                    returns_location_id = 9 if warehouse == 3 else 4304
+                # Ubicación de asignación de ESTE ítem. El merchant ya se resolvió
+                # arriba del loop: se llamaba a _get_merchant_name() una vez por item
+                # para recalcular siempre lo mismo.
+                returns_location_id = self._location_de(warehouse, item)
 
                 # Guardamos la referencia directa del ID de la devolución que nos devolvió Mintsoft
                 items_to_allocate.append({
@@ -1087,6 +1176,9 @@ class MintsoftReturnService:
         try:
             merchant_name = self._get_merchant_name(data)
             client_id = map_client(merchant_name)  # Si no encuentra devuelve None
+            # Una sola vez, no una por item: antes se llamaba a _get_merchant_name()
+            # y map_warehouse() dentro del loop para recalcular siempre lo mismo.
+            warehouse = map_warehouse(merchant_name) # 3 si es Wholesale, 5 si es E-Comm
             event_data = data.get("event_data") or {}
             line_items = event_data.get("line_items", []) or []
             for item in line_items:
@@ -1108,9 +1200,9 @@ class MintsoftReturnService:
                     faltantes.append(str(sku))
                     continue
 
-                sku, product_id = self.client.get_product_id(sku, client_id, _get_item_barcode(item))
-                merchant = self._get_merchant_name(data)
-                warehouse = map_warehouse(merchant) # 3 si es Wholesale, 5 si es E-Comm
+                sku, product_id = self._resolver_product_id(
+                    item, client_id, crear_si_falta=False
+                )
                 carton_code = (item.get("put_away_bin") or "").strip()
 
                 if not carton_code:
@@ -1124,11 +1216,11 @@ class MintsoftReturnService:
                     continue
 
                 disposition = item.get("disposition")
-                if disposition == "Return to Stock": # Stock en buenas condiciones
+                if config.es_buen_estado(disposition): # Stock en buenas condiciones
 
                     reallocation_data = {
                         "SourceWarehouseId": warehouse,
-                        "SourceNameOrCode": "RET",
+                        "SourceNameOrCode": config.SOURCE_GOOD,
                         "DestinationWarehouseId": warehouse,
                         "DestinationNameOrCode": carton_code,
                         "ProductId": product_id,
@@ -1136,29 +1228,13 @@ class MintsoftReturnService:
                         "Comment": "Return reallocation",
                     }
 
-                    if self.client.check_carton(carton_code) == False: # Check si existe la caja
-                        print(f'Carton {carton_code} not in Mintsoft - creating Carton...')
-                        client_id = map_client(merchant)
-
-                        if warehouse == 3:
-                            returns_location_id = 4104 # RET Wholesale
-                        else:
-                            returns_location_id = 4299 # RET Ecom
-
-                        carton_data = {
-                            "WarehouseId": warehouse,
-                            "StorageMediaName": "Stock",
-                            "Code": carton_code,
-                            "LocationId": returns_location_id
-                        }
-
-                        self.client.create_carton(carton_data, client_id)
+                    self._asegurar_caja(carton_code, warehouse, client_id)
 
                     response = self._transfer_stock_resiliente(
                         reallocation_data, sku, client_id, stock_cache
                     )
                     responses.append(response)
-                    print(response)
+                    self.logger.info(f"{sku}: transfer a {carton_code!r} -> {response}")
 
                 else: # Stock a mandar a cuarentena
 
@@ -1187,16 +1263,13 @@ class MintsoftReturnService:
                     # en la rama interna la unidad ya esta cuarentenada y Mintsoft va a
                     # rechazar el movimiento, y ahi el transfer de abajo funciona igual.
 
-                    if warehouse == 3:
-                        temporary_location_id = 9    # RET-TEMP Wholesale
-                        returns_location_id = 4104   # RET Wholesale
-                    else:
-                        temporary_location_id = 4304 # RET-TEMP E-Comm
-                        returns_location_id = 4299   # RET E-Comm
+                    temporary_location_id = config.location_id(
+                        warehouse, buen_estado=False
+                    )
 
                     reallocation_data = {
                         "SourceWarehouseId": warehouse,
-                        "SourceNameOrCode": "RET-TEMP",
+                        "SourceNameOrCode": config.SOURCE_QUARANTINE,
                         "DestinationWarehouseId": warehouse,
                         "DestinationNameOrCode": carton_code,
                         "ProductId": product_id,
@@ -1205,33 +1278,9 @@ class MintsoftReturnService:
                         "Comment": "Return reallocation",
                     }
 
-                    if self.client.check_carton(carton_code) == False: # Check si existe la caja
-                        print(f'Carton {carton_code} not in Mintsoft - creating Carton...')
-                        client_id = map_client(merchant)
-
-                        # La caja se crea en RET, NO en RET-TEMP, por dos razones:
-                        #
-                        #  1. Es donde tiene que quedar la mercadería: RET-TEMP es la
-                        #     location transitoria de aislamiento, no un destino.
-                        #  2. Si la caja vive en RET-TEMP -- la misma location a la que
-                        #     el confirm alloca el item -- y ya contiene ese SKU, Mintsoft
-                        #     consolida la unidad nueva adentro de la caja y no queda nada
-                        #     suelto. Después el TransferStock falla con "Could not find
-                        #     any of product ID: X in RET-TEMP!". Con la caja en RET eso
-                        #     no pasa: el confirm deja la unidad suelta en RET-TEMP y el
-                        #     transfer siempre la encuentra.
-                        #
-                        # El transfer sigue saliendo de RET-TEMP: el destino es el código
-                        # de caja, y Mintsoft arrastra la unidad a la location de la caja
-                        # conservando Type='Quarantine'.
-                        carton_data = {
-                            "WarehouseId": warehouse,
-                            "StorageMediaName": "Stock",
-                            "Code": carton_code,
-                            "LocationId": returns_location_id
-                        }
-
-                        self.client.create_carton(carton_data, client_id)
+                    # La caja se crea en RET, no en RET-TEMP. El por qué está en
+                    # _asegurar_caja.
+                    self._asegurar_caja(carton_code, warehouse, client_id)
 
                     try:
                         self.client.quarantine_stock({
@@ -1266,7 +1315,7 @@ class MintsoftReturnService:
                         reallocation_data, sku, client_id, stock_cache
                     )
                     responses.append(response)
-                    print(response)
+                    self.logger.info(f"{sku}: transfer a {carton_code!r} -> {response}")
 
             if sin_caja:
                 raise RuntimeError(

@@ -3,8 +3,12 @@ import threading
 import requests
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
-import json
+
+from loggers.main_logger import get_logger
+
 load_dotenv()
+
+logger = get_logger("mintsoft_client")
 
 
 
@@ -194,7 +198,13 @@ class MintsoftOrderClient:
         return response.get("ID")
 
     def create_external_return(self, data:Dict[str, Any]):
-        print("data", data)
+        # Sin volcar el payload entero: trae los SKUs y el tracking del comprador.
+        logger.info(
+            f"CreateExternalReturn: ClientId={data.get('ClientId')} "
+            f"WarehouseId={data.get('WarehouseId')} "
+            f"Reference={data.get('Reference')!r} "
+            f"items={len(data.get('ReturnItems') or [])}"
+        )
         url = f"{self.BASE_URL}/api/Return/CreateExternalReturn"
 
         r = self._request("POST", 
@@ -204,7 +214,7 @@ class MintsoftOrderClient:
         )
 
         response = self._toolkit_result(r, "Return/CreateExternalReturn")
-        print("resp", response)
+        logger.info(f"CreateExternalReturn -> {response}")
 
         # Mintsoft contesta 200 con Success=false cuando rechaza el return (por
         # ejemplo un ProductId que no existe). Antes se devolvia response["ID"]
@@ -375,7 +385,7 @@ class MintsoftOrderClient:
 
         r.raise_for_status()
         data = r.json()
-        print(data)
+        logger.info(f"Return/Reasons -> {data}")
         return data
 
     def get_return_details(self, return_id):
@@ -430,7 +440,7 @@ class MintsoftOrderClient:
             None,
         )
 
-        print(f"Product ID for SKU {sku} (ClientId {client_id}): {product_id}")
+        logger.info(f"Product ID for SKU {sku} (ClientId {client_id}): {product_id}")
 
         # barcode puede venir None (los payloads de RMA no traen line_items[].barcode),
         # asi que se normaliza antes de medirlo: antes esto reventaba con
@@ -453,16 +463,23 @@ class MintsoftOrderClient:
 
             r.raise_for_status()
             data = r.json()
-            try: 
+            # except: pelado atrapaba tambien KeyboardInterrupt y SystemExit.
+            try:
                 product_id = data[0]["ID"]
-                print(product_id, "producto change")
+                logger.info(
+                    f"SKU resuelto por barcode: {sku!r} -> {sku_rety!r} "
+                    f"(ProductId {product_id})"
+                )
                 sku = sku_rety
-                
-            except:
+            except (IndexError, KeyError, TypeError):
+                logger.warning(
+                    f"El barcode {barcode!r} resolvio al SKU {sku_rety!r}, pero "
+                    f"Product/Search no devolvio ningun producto para ese SKU."
+                )
                 product_id = None
-        
-        print(sku, product_id, "producto final")
-            
+
+        logger.info(f"SKU final {sku!r} -> ProductId {product_id!r}")
+
         return sku, product_id
     
 
@@ -516,8 +533,10 @@ class MintsoftOrderClient:
 
         response = self._toolkit_result(r, "StorageMedia/CreateCarton")
         if not response.get("Success"):
-            print(f"⚠️ Mintsoft rechazó CreateCarton {carton_data.get('Code')!r}: "
-                  f"{response.get('Message')!r}")
+            logger.warning(
+                f"Mintsoft rechazó CreateCarton {carton_data.get('Code')!r}: "
+                f"{response.get('Message')!r}"
+            )
         return response
     
     def create_product(self, product_data):
@@ -531,12 +550,16 @@ class MintsoftOrderClient:
             success = body.get("Success", False)
 
             if success:
-                print(f"Se ha creado exitosamente el SKU {product_data['SKU']}")
+                logger.info(f"Se ha creado exitosamente el SKU {product_data['SKU']}")
                 return product_id
-            else:
-                # Mintsoft can return 200 with Success=false and an error in Message
-                print(f"Mintsoft rechazó el SKU {product_data['SKU']}: {body.get('Message')}")
-                return None
 
-        print(f"Error {r.status_code} creando SKU {product_data['SKU']}: {r.text}")
+            # Mintsoft can return 200 with Success=false and an error in Message
+            logger.error(
+                f"Mintsoft rechazó el SKU {product_data['SKU']}: {body.get('Message')}"
+            )
+            return None
+
+        logger.error(
+            f"Error {r.status_code} creando SKU {product_data['SKU']}: {r.text}"
+        )
         return None

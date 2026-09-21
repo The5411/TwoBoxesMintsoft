@@ -16,15 +16,6 @@ def postear(cuerpo):
     return r
 
 
-@pytest.fixture(autouse=True)
-def throttle_limpio():
-    """El throttle es estado de modulo: se limpia para que un test no afecte al otro."""
-    import mappers.mintsoft_mapper as mm
-    mm._alert_last_sent.clear()
-    yield
-    mm._alert_last_sent.clear()
-
-
 def test_COR26_event_type_no_soportado_avisa_y_no_escribe(mails):
     cli = ClienteFalso(); listener.return_service.client = cli
     r = postear(payload(event_type="return-created", event_id="e-26"))

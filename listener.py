@@ -1,19 +1,48 @@
-from flask import Flask, request, jsonify
+"""Endpoint HTTP que recibe los webhooks de Two Boxes.
+
+Responsabilidades, en orden de importancia:
+
+  1. Autenticar y devolver 200 en milisegundos. Un 5xx hace que Two Boxes
+     reintente, y un handler lento hace que gunicorn mate al worker por timeout.
+  2. Garantizar que cada evento se procese UNA sola vez (storage/event_store.py).
+  3. Despachar el procesamiento en Mintsoft y el archivado a Google en pools
+     separados, para que un Google Apps Script lento no demore el WMS.
+"""
 import hmac
 import os
-import threading
-import traceback
-from collections import OrderedDict
-import requests
-from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor
-from services.mintsoft_service import MintsoftReturnService
-from mappers.mintsoft_mapper import _send_alert_email
-from urllib3.util.retry import Retry
+from threading import Lock
+
+import requests
 from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 load_dotenv()
+
+import config
+from loggers.main_logger import get_logger
+from mappers.mintsoft_mapper import _send_alert_email
+from services.mintsoft_service import MintsoftReturnService
+from storage.event_store import (
+    ESTADO_FALLADO,
+    ESTADO_IGNORADO,
+    ESTADO_PROCESADO,
+    EventStore,
+)
+
+logger = get_logger("listener")
+
 app = Flask(__name__)
 return_service = MintsoftReturnService()
+
+# Store de eventos: persistencia e idempotencia (E-1 / OPS-01 / COR-07).
+# Se construye al importar para que un problema de configuración se vea en el
+# arranque, pero su constructor nunca lanza: si la base no está, queda
+# `disponible = False` y el handler lo trata como tal.
+event_store = EventStore()
+return_service.store = event_store
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 GAS_URL = os.environ.get("GAS_URL")
@@ -22,26 +51,21 @@ WEBHOOKS_URL = os.environ.get("WEBHOOKS_URL")
 # Tipos de evento que este servicio sabe procesar. Two Boxes manda todo a la misma
 # URL y antes no se miraba event_type en ningun lado, asi que cualquier tipo con
 # otra forma entraba igual a procesar_webhook.
-EVENT_TYPES_SOPORTADOS = {
-    t.strip() for t in os.environ.get("EVENT_TYPES", "return-complete").split(",") if t.strip()
-}
+EVENT_TYPES_SOPORTADOS = config.EVENT_TYPES_SOPORTADOS
 
 # Rechazar cuerpos gigantes antes de parsearlos.
-app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", 5 * 1024 * 1024))
-
-# --- Guarda de reentrega (parcial de COR-07) --------------------------------------
-# NO es idempotencia de verdad: vive en memoria, se pierde en cada reinicio y no se
-# comparte entre los workers de gunicorn. Solo frena la reentrega del MISMO event_id
-# al mismo worker, que es el caso comun cuando Two Boxes reintenta. La regla
-# operativa sigue en pie: no reenviar webhooks a mano hasta que exista la
-# persistencia (E-1), porque un reenvio que caiga en el otro worker SI duplica.
-_EVENTOS_VISTOS_MAX = 2000
-_eventos_vistos = OrderedDict()
-_eventos_lock = threading.Lock()
+app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
 
 # Contadores para /health.
-_metricas = {"recibidos": 0, "procesados": 0, "fallados": 0, "duplicados": 0, "ignorados": 0}
-_metricas_lock = threading.Lock()
+_metricas = {
+    "recibidos": 0,
+    "procesados": 0,
+    "fallados": 0,
+    "duplicados": 0,
+    "ignorados": 0,
+    "sin_store": 0,
+}
+_metricas_lock = Lock()
 
 
 def _contar(clave):
@@ -49,22 +73,20 @@ def _contar(clave):
         _metricas[clave] = _metricas.get(clave, 0) + 1
 
 
-def _ya_procesado(event_id) -> bool:
-    """True si este worker ya vio ese event_id. Lo registra si es nuevo."""
-    if not event_id:
-        return False
-    with _eventos_lock:
-        if event_id in _eventos_vistos:
-            return True
-        _eventos_vistos[event_id] = True
-        while len(_eventos_vistos) > _EVENTOS_VISTOS_MAX:
-            _eventos_vistos.popitem(last=False)
-    return False
+# --- Pools ---------------------------------------------------------------------
+# Dos pools separados a propósito (S-7). Antes los tres trabajos compartían un
+# único ThreadPoolExecutor(10): el archivado a Google tiene timeouts de 60 y 120
+# segundos, así que unos pocos eventos con Apps Script lento se quedaban con
+# todos los threads y el procesamiento en Mintsoft -- lo único que no se puede
+# perder ni reintentar sin riesgo -- quedaba encolado detrás del archivado.
+executor = ThreadPoolExecutor(
+    max_workers=config.WORKERS_MINTSOFT, thread_name_prefix="mintsoft"
+)
+archivo_executor = ThreadPoolExecutor(
+    max_workers=config.WORKERS_ARCHIVO, thread_name_prefix="archivo"
+)
 
-
-executor = ThreadPoolExecutor(max_workers=10)
-
-# Configuración de reintentos
+# Configuración de reintentos para el archivado a Google.
 session = requests.Session()
 retries = Retry(
     total=5,               # Reintentos
@@ -76,8 +98,10 @@ session.mount('https://', HTTPAdapter(max_retries=retries))
 
 
 def enviar_webhook_a_google(datos):
+    if not WEBHOOKS_URL:
+        logger.debug("WEBHOOKS_URL no configurada: no se notifica por SKU")
+        return
     try:
-        print(WEBHOOKS_URL)
         response = requests.post(
             WEBHOOKS_URL,
             json=datos,
@@ -85,13 +109,14 @@ def enviar_webhook_a_google(datos):
             allow_redirects=True  # Crucial para seguir el redireccionamiento /echo de Google
         )
         response.raise_for_status()
-        print("✅ Respuesta de Google:", response.json())
+        logger.info("Notificacion a Google OK")
     except Exception as e:
-        print(f"❌ Error al enviar datos: {e}")
+        logger.error(f"Error notificando a Google: {e}")
+
 
 def enviar_webhook_por_sku(datos):
-    # Corre en un thread del executor: si dejamos escapar una excepción queda
-    # atrapada en el Future y no la ve nadie.
+    # Corre en un thread del pool de archivado: si dejamos escapar una excepción
+    # queda atrapada en el Future y no la ve nadie.
     try:
         event_data = datos.get('event_data', {})
         line_items = event_data.get('line_items', [])
@@ -103,21 +128,23 @@ def enviar_webhook_por_sku(datos):
             payload['event_data'] = dict(event_data)
             payload['event_data']['line_items'] = [item]
 
-            print(f"➡️ Enviando SKU: {item.get('sku')}")
+            logger.info(f"Notificando SKU {(item or {}).get('sku')!r} a Google")
             enviar_webhook_a_google(payload)
     except Exception as e:
-        print(f"❌ Error en enviar_webhook_por_sku: {e}")
-        traceback.print_exc()
-
+        logger.error(f"Error en enviar_webhook_por_sku: {e}", exc_info=True)
 
 
 def enviar_a_google_async(datos):
-    """Función para enviar datos en segundo plano"""
+    """Archiva el JSON en Google Drive. Corre en el pool de archivado."""
+    if not GAS_URL:
+        logger.debug("GAS_URL no configurada: no se archiva el payload")
+        return
     try:
         session.post(GAS_URL, json=datos, timeout=120)
-        print("✅ Enviado a Google Apps Script correctamente")
+        logger.info("Payload archivado en Google Apps Script")
     except Exception as e:
-        print(f"❌ Error enviando a Google: {e}")
+        logger.error(f"Error archivando en Google: {e}")
+
 
 PII_KEYS = ("customer", "rma_address")
 
@@ -163,14 +190,57 @@ def _identificar_return(data):
         return None
 
 
-def procesar_webhook(data):
+def _avisar_duplicado_por_reference(reference, previos):
+    """Avisa que otro evento ya creó un return con esta misma Reference.
+
+    Es la segunda red de idempotencia: el claim del store frena el MISMO evento,
+    y esto detecta un evento DISTINTO que apunta al mismo return (por ejemplo un
+    payload reeditado a mano, o Two Boxes reemitiendo con otro id).
+    """
+    detalle = ", ".join(
+        f"return {p.get('return_id')} ({p.get('return_kind')}) del evento "
+        f"{p.get('event_key')} el {p.get('created_at')}"
+        for p in previos
+    )
+    bloquear = config.DUPLICATE_REFERENCE_ACTION == "block"
+    logger.warning(
+        f"Reference {reference!r} ya tiene return(s) creado(s): {detalle}. "
+        f"DUPLICATE_REFERENCE_ACTION={config.DUPLICATE_REFERENCE_ACTION!r} -> "
+        f"{'NO se procesa' if bloquear else 'se procesa igual'}."
+    )
+    _send_alert_email(
+        subject=f"[Mintsoft] Posible return duplicado - PO {reference}",
+        body=(
+            f"Llego un webhook NUEVO cuya Reference ({reference}) ya tiene un return "
+            f"creado en Mintsoft:\n\n  {detalle}\n\n"
+            + (
+                "No se proceso en Mintsoft (DUPLICATE_REFERENCE_ACTION=block), asi "
+                "que no se creo un segundo return. Si esta devolucion es legitima y "
+                "distinta de la anterior, hay que cargarla a mano.\n\n"
+                if bloquear else
+                "SE PROCESO igual (DUPLICATE_REFERENCE_ACTION=warn), asi que puede "
+                "haber quedado un segundo return con el mismo stock. Revisar los dos "
+                "returns en Mintsoft y anular el que sobre.\n\n"
+                "Para que estos casos NO se procesen, poner "
+                "DUPLICATE_REFERENCE_ACTION=block.\n\n"
+            )
+            + f"Una misma orden puede tener dos devoluciones legitimas en momentos "
+              f"distintos, por eso esto es un aviso y no un error."
+        ),
+    )
+    return not bloquear
+
+
+def procesar_webhook(data, event_key=None):
     # Un webhook = un mail. El reporte junta los problemas de todas las capas y se
     # manda una sola vez en el finally, en vez de un mail por capa que fallaba.
-    return_service.begin_webhook_report(data)
+    return_service.begin_webhook_report(data, event_key=event_key)
+    estado_final = ESTADO_FALLADO
+    error_final = None
     try:
         # Crea return interno o externo
         return_id = return_service.create_return(data)
-        print(return_id)
+        logger.info(f"create_return -> {return_id}")
 
         # Pasar items de RET o RET-QT a la caja del return si es External
         if return_id[1] == "External Return Created":
@@ -192,8 +262,8 @@ def procesar_webhook(data):
             armado_ok = return_service.add_return_items(return_id[0], data)
 
             if armado_ok is False:
-                print(
-                    f"⚠️ El armado del return {return_id[0]} fallo: NO se reubica el "
+                logger.error(
+                    f"El armado del return {return_id[0]} fallo: NO se reubica el "
                     f"stock. Queda en RET / RET-TEMP esperando intervencion."
                 )
             else:
@@ -204,18 +274,25 @@ def procesar_webhook(data):
         # se imprimia igual con (None, "No Return Created"), que es justo el caso
         # que hay que revisar.
         if return_id and return_id[1] == "No Return Created":
-            print(f"⚠️ Webhook NO produjo return en Mintsoft ({return_id[1]})")
+            logger.warning(f"Webhook NO produjo return en Mintsoft ({return_id[1]})")
+            # No es un fallo del servicio: puede ser un merchant no mapeado o un
+            # return con todos los items Missing. Queda marcado como ignorado para
+            # que un reproceso no lo confunda con un evento nunca visto.
+            estado_final = ESTADO_IGNORADO
+            error_final = return_id[1]
         else:
             _contar("procesados")
-            print("Webhook procesado con exito")
+            estado_final = ESTADO_PROCESADO
+            logger.info("Webhook procesado con exito")
 
     except Exception as e:
         # Catch-all: cualquier fallo que no haya sido capturado (y notificado) dentro
         # de MintsoftReturnService llega hasta acá. Sin esto el error solo se imprimía
         # en los logs y nadie se enteraba.
         _contar("fallados")
-        print(f"Error procesando webhook: {e}")
-        traceback.print_exc()
+        estado_final = ESTADO_FALLADO
+        error_final = f"{type(e).__name__}: {e}"
+        logger.error(f"Error procesando webhook: {e}", exc_info=True)
         try:
             # Si la capa de abajo ya reporto esta misma excepcion, el reporte la
             # deduplica y esto no agrega nada. Queda para los fallos que no paso
@@ -224,21 +301,30 @@ def procesar_webhook(data):
                 method="procesar_webhook",
                 error=e,
                 order_reference=_identificar_return(data),
-                context={"origen": "listener.procesar_webhook"},
+                context={"origen": "listener.procesar_webhook", "event_key": event_key},
                 que_falta="El webhook no se pudo procesar",
                 accion=(
-                    "Revisar el payload y reprocesarlo. Ojo: reprocesar crea un return "
-                    "nuevo en Mintsoft, no actualiza el anterior (no hay idempotencia)."
+                    "Revisar el payload y reprocesarlo. El reproceso NO duplica el "
+                    "return: si el return ya se habia creado, el servicio lo detecta "
+                    "y avisa en vez de crear otro."
                 ),
             )
         except Exception as mail_err:
-            print(f"❌ No se pudo registrar el error: {mail_err}")
+            logger.error(f"No se pudo registrar el error: {mail_err}")
     finally:
+        # Cerrar el evento en el store ANTES del reporte: si el mail falla, el
+        # estado del evento tiene que quedar igual grabado.
+        if event_key:
+            try:
+                event_store.finish(event_key, estado_final, error_final)
+            except Exception as store_err:
+                logger.error(f"No se pudo cerrar el evento en el store: {store_err}")
         # Siempre, incluso si todo salio bien (ahi no manda nada).
         try:
             return_service.flush_webhook_report()
         except Exception as flush_err:
-            print(f"❌ No se pudo enviar el reporte del webhook: {flush_err}")
+            logger.error(f"No se pudo enviar el reporte del webhook: {flush_err}")
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -247,14 +333,14 @@ def webhook():
     # caracter por vez.
     token = request.headers.get("x-two-boxes-authorization")
     if not WEBHOOK_SECRET:
-        print("❌ WEBHOOK_SECRET no esta seteada: se rechaza todo")
+        logger.error("WEBHOOK_SECRET no esta seteada: se rechaza todo")
         return jsonify({"error": "Unauthorized"}), 401
     if not token or not hmac.compare_digest(str(token), str(WEBHOOK_SECRET)):
-        print(f"Unauthorized Access Request desde {request.remote_addr}")
+        logger.warning(f"Unauthorized Access Request desde {request.remote_addr}")
         return jsonify({"error": "Unauthorized"}), 401
 
     _contar("recibidos")
-    
+
     raw_data = request.get_json(silent=True)
     if not raw_data:
         return jsonify({"error": "No data"}), 400
@@ -265,6 +351,7 @@ def webhook():
     # el archivado a GAS falla, y es lo que permite distinguir "Two Boxes manda
     # otro event_type" de "un monitor / un script de retry esta posteando".
     event_type = event_id = n_items = merchant = None
+    reference = None
     if isinstance(raw_data, dict):
         event_type = raw_data.get("event_type")
         event_id = raw_data.get("id")
@@ -279,16 +366,21 @@ def webhook():
                 merchant = return_service._get_merchant_name(raw_data) or None
             except Exception as e:
                 merchant = f"<error resolviendo merchant: {e}>"
-    print(
-        f"📥 POST /webhook event_type={event_type!r} id={event_id!r} "
-        f"line_items={n_items} merchant={merchant!r} "
+        try:
+            reference = return_service._return_identifier(raw_data)
+        except Exception:
+            reference = None
+
+    logger.info(
+        f"POST /webhook event_type={event_type!r} id={event_id!r} "
+        f"line_items={n_items} merchant={merchant!r} reference={reference!r} "
         f"remote_addr={request.remote_addr} "
         f"user_agent={request.headers.get('User-Agent')!r}"
     )
     # El payload completo traia customer.full_name, customer.email y la direccion
     # del RMA al log agregado de la plataforma. Se redactan esos campos y se deja
     # el resto: el tracking y los SKUs son lo que se necesita para operar.
-    print("payload:", _redactar_pii(thread_data))
+    logger.info(f"payload: {_redactar_pii(thread_data)}")
 
     # COR-26 -- solo los tipos soportados llegan a Mintsoft. Two Boxes manda todo
     # a la misma URL y antes no se miraba event_type en ningun lado, asi que un
@@ -297,11 +389,19 @@ def webhook():
     procesable = event_type in EVENT_TYPES_SOPORTADOS
     if not procesable:
         _contar("ignorados")
-        print(
-            f"⏭️ event_type={event_type!r} no soportado "
+        logger.warning(
+            f"event_type={event_type!r} no soportado "
             f"(soportados: {sorted(EVENT_TYPES_SOPORTADOS)}). "
             f"Se archiva pero NO se procesa en Mintsoft."
         )
+        # Queda registrado igual, para poder responder "esto llego?" despues.
+        try:
+            event_store.registrar_ignorado(
+                raw_data, event_id=event_id, event_type=event_type,
+                merchant=merchant, motivo="event_type no soportado",
+            )
+        except Exception as e:
+            logger.error(f"No se pudo registrar el evento ignorado: {e}")
         # Avisar por mail, no solo loguear: si Two Boxes empieza a mandar un tipo
         # nuevo que SI habria que procesar, una linea en el log no lo hace visible.
         # Va con el throttle del mapper (ALERT_THROTTLE_SECONDS, default 30 min) y
@@ -324,47 +424,134 @@ def webhook():
             ),
         )
 
-    # Guarda de reentrega: parcial, por proceso. Ver el comentario de _ya_procesado.
-    if procesable and _ya_procesado(event_id):
-        procesable = False
-        _contar("duplicados")
-        print(
-            f"⏭️ event_id={event_id!r} ya fue procesado por este worker: se saltea "
-            f"para no crear un segundo return. Se archiva igual."
+    # --- Idempotencia (E-1 / OPS-01 / COR-07) ---------------------------------
+    # El claim es atómico y persistente, así que cubre los tres casos que el
+    # OrderedDict en memoria no cubría: el reinicio, el otro worker de gunicorn,
+    # y el reproceso a mano de un evento cuyo return YA se creó.
+    event_key = None
+    if procesable:
+        veredicto = event_store.claim(
+            raw_data, event_id=event_id, event_type=event_type,
+            merchant=merchant, reference=reference,
         )
+        if veredicto.otorgado:
+            event_key = veredicto.registro.get("event_key") or event_store.clave_de(
+                raw_data, event_id
+            )
+            if veredicto.motivo != "nuevo":
+                logger.warning(
+                    f"Evento {event_key} retomado ({veredicto.motivo}): "
+                    f"intento numero {int(veredicto.registro.get('attempts') or 1) + 1}"
+                )
+        elif veredicto.motivo == "store_caido":
+            # No se puede garantizar que no sea un duplicado. Se archiva y se avisa,
+            # pero NO se escribe en el WMS: duplicar stock es peor que demorar el
+            # return. Con REQUIRE_STORE=false se procesa igual, a riesgo.
+            _contar("sin_store")
+            procesable = not config.REQUIRE_STORE
+            logger.error(
+                f"El store de eventos no responde ({veredicto.detalle}). "
+                f"REQUIRE_STORE={config.REQUIRE_STORE} -> "
+                f"{'se procesa a riesgo de duplicar' if procesable else 'NO se procesa'}."
+            )
+            _send_alert_email(
+                subject="[Mintsoft] Base de idempotencia caida",
+                body=(
+                    f"No se pudo consultar la base que evita procesar dos veces el "
+                    f"mismo webhook.\n\nError: {veredicto.detalle}\n\n"
+                    + (
+                        "El webhook SE PROCESO igual porque REQUIRE_STORE=false: si "
+                        "Two Boxes reintenta, puede quedar un return duplicado.\n\n"
+                        if procesable else
+                        "El webhook NO se proceso en Mintsoft. Se archivo, asi que no "
+                        "se perdio: una vez arreglada la base hay que reenviarlo.\n\n"
+                    )
+                    + f"backend: {event_store.backend}\n"
+                      f"event id: {event_id}\nreference: {reference}\n"
+                ),
+            )
+        else:
+            procesable = False
+            _contar("duplicados")
+            logger.warning(
+                f"Evento no procesado ({veredicto.motivo}): {veredicto.detalle}. "
+                f"Se archiva igual."
+            )
+            if veredicto.motivo == "return_ya_creado":
+                # Este es el caso de la orden W836: alguien reprocesa un webhook cuyo
+                # return ya existe. Antes se creaba un segundo return con el mismo
+                # stock; ahora se avisa para que lo completen a mano.
+                _send_alert_email(
+                    subject=f"[Mintsoft] Reproceso frenado, el return ya existe - PO {reference}",
+                    body=(
+                        f"Se reprocesó un webhook cuyo return YA se había creado en "
+                        f"Mintsoft, asi que NO se creo un segundo.\n\n"
+                        f"{veredicto.detalle}\n\n"
+                        f"El intento anterior creó el return pero no llegó a "
+                        f"terminarlo, asi que probablemente le falten items o el "
+                        f"movimiento de stock. Hay que completarlo a mano desde "
+                        f"Mintsoft, no reenviando el webhook.\n\n"
+                        f"return_id: {veredicto.return_id}\n"
+                        f"reference: {reference}\n"
+                        f"event id:  {event_id}\n"
+                    ),
+                )
+
+    # Segunda red: un evento NUEVO cuya Reference ya tiene un return creado.
+    if procesable and event_key and config.DUPLICATE_REFERENCE_ACTION != "off":
+        previos = event_store.returns_por_reference(reference, excluir_event_key=event_key)
+        if previos:
+            procesable = _avisar_duplicado_por_reference(reference, previos)
+            if not procesable:
+                _contar("duplicados")
+                event_store.finish(event_key, ESTADO_IGNORADO, "reference duplicada")
 
     # Todo se despacha en segundo plano: el handler tiene que devolver 200 en
     # milisegundos. Si algo bloquea acá, gunicorn mata al worker por timeout y se
     # pierde el resto del procesamiento sin dejar rastro.
 
-    # 1. Procesarlo en Mintsoft (la operación de negocio, va primero)
+    # 1. Procesarlo en Mintsoft (la operación de negocio, va en su propio pool)
     if procesable:
-        executor.submit(procesar_webhook, raw_data)
+        executor.submit(procesar_webhook, raw_data, event_key)
 
-    # 2. Subir JSON al Google Drive
-    executor.submit(enviar_a_google_async, thread_data)
+    # 2. Subir JSON al Google Drive (pool de archivado)
+    archivo_executor.submit(enviar_a_google_async, thread_data)
 
-    # 3. Notificar a Google un webhook por SKU
-    executor.submit(enviar_webhook_por_sku, thread_data)
+    # 3. Notificar a Google un webhook por SKU (pool de archivado)
+    archivo_executor.submit(enviar_webhook_por_sku, thread_data)
 
     return "", 200
+
 
 @app.route("/health", methods=["GET"])
 def health():
     """Estado del servicio y contadores. No toca Mintsoft: tiene que responder
-    aunque el WMS este caido, que es justo cuando el health check importa."""
+    aunque el WMS este caido, que es justo cuando el health check importa.
+
+    Sí consulta el store, porque sin él el servicio no puede garantizar que no
+    duplique returns, y eso es parte de estar sano.
+    """
     with _metricas_lock:
         metricas = dict(_metricas)
+
+    store = event_store.stats()
+    ok = store.get("disponible") or not config.REQUIRE_STORE
+
     return jsonify({
-        "status": "ok",
+        "status": "ok" if ok else "degraded",
         "event_types_soportados": sorted(EVENT_TYPES_SOPORTADOS),
         "config": {
             "webhook_secret": bool(WEBHOOK_SECRET),
             "gas_url": bool(GAS_URL),
             "webhooks_url": bool(WEBHOOKS_URL),
+            "require_store": config.REQUIRE_STORE,
+            "duplicate_reference_action": config.DUPLICATE_REFERENCE_ACTION,
+            "returnable_order_status_ids": sorted(config.RETURNABLE_ORDER_STATUS_IDS),
+            "return_locations": {str(k): v for k, v in config.RETURN_LOCATIONS.items()},
         },
+        "store": store,
         "metricas": metricas,
-    }), 200
+    }), 200 if ok else 503
 
 
 if __name__ == "__main__":

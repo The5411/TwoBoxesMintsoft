@@ -122,3 +122,54 @@ def test_un_solo_mail_por_webhook(mails):
     assert len(mails) == 1, f"se esperaba 1 mail, salieron {len(mails)}"
     cuerpo = mails[0].get_content()
     assert "problema(s)" in cuerpo
+
+
+# ---------------------------------------------------------------- E-4
+def test_una_orden_que_no_salio_del_deposito_no_lleva_return_interno(mails):
+    """Los estados que habilitan un return interno son configurables (4, 5, 6).
+
+    Una orden en estado 1 (PENDING) existe en Mintsoft pero todavia no se
+    despacho: no corresponde crearle un return interno.
+    """
+    cli = ClienteFalso(order_status_id=1)
+    procesar(cli, payload())
+
+    assert cli.hizo("create_return") == [], \
+        "una orden sin despachar no puede recibir un return interno"
+    assert cli.hizo("create_external_return"), \
+        "se crea como externo, que es el camino correcto"
+
+
+def test_se_puede_habilitar_un_estado_nuevo_sin_deploy(mails, monkeypatch):
+    cli = ClienteFalso(order_status_id=17)
+    monkeypatch.setattr(
+        listener.return_service, "returnable_status_ids", {4, 5, 6, 17}
+    )
+    procesar(cli, payload())
+
+    assert cli.hizo("create_return"), "con el estado habilitado va por interno"
+
+
+# ---------------------------------------------------------------- S-1
+def test_la_caja_de_un_item_en_cuarentena_se_crea_en_RET_no_en_RET_TEMP(mails):
+    """Si la caja se crea en RET-TEMP, Mintsoft consolida la unidad adentro y el
+    TransferStock posterior falla con 'Could not find any of product ID: X in
+    RET-TEMP!'. Por eso la caja va siempre a RET."""
+    import config
+
+    class SinCaja(ClienteFalso):
+        def check_carton(self, code):
+            self.llamadas.append(("check_carton", code))
+            return False  # la caja no existe: hay que crearla
+
+        def create_carton(self, data, client_id):
+            self.llamadas.append(("create_carton", data.get("LocationId")))
+            return {"Success": True}
+
+    cli = SinCaja()
+    # disposition 'Exception' -> cuarentena, warehouse 5 (bronze snake)
+    procesar(cli, payload([item("QT", "Exception")]))
+
+    creadas = [c[1] for c in cli.hizo("create_carton")]
+    assert creadas == [config.location_id(5, buen_estado=True)] == [4299], \
+        "la caja tiene que crearse en RET (4299), no en RET-TEMP (4304)"

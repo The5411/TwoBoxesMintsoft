@@ -4,6 +4,10 @@ import threading
 import time
 from email.message import EmailMessage
 
+from loggers.main_logger import get_logger
+
+logger = get_logger("mintsoft_mapper")
+
 clients = [
   { "m_name": "Acler", "m_id": 19, "tb_name": "acler", "tb_rma_prov": "Work Capture", "warehouse_id": 3},
   { "m_name": "Significant Other", "m_id": 33, "tb_name": "significant other", "tb_rma_prov": "Work Capture", "warehouse_id": 3},
@@ -101,7 +105,7 @@ def _send_alert_email(subject: str, body: str) -> None:
     romper al caller."""
     allowed, suppressed = _alert_allowed(subject)
     if not allowed:
-        print(
+        logger.info(
             f"[alerta suprimida] repetida {suppressed}x en los ultimos "
             f"{_ALERT_WINDOW_SECONDS}s: {subject}"
         )

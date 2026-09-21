@@ -62,3 +62,11 @@ jsonretry.json
 
 # ---- Herramientas de debug locales, no van al repo ----
 retry_webhook.py
+
+# Store de eventos en SQLite (desarrollo / fallback)
+webhook_events.db
+webhook_events.db-wal
+webhook_events.db-shm
+*.db
+*.db-wal
+*.db-shm

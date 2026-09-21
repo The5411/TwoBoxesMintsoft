@@ -18,6 +18,7 @@ correcta del depósito y moviéndolo a la caja física que usó el operario.
 - [Variables de entorno](#variables-de-entorno)
 - [Correr localmente](#correr-localmente)
 - [Contrato del webhook](#contrato-del-webhook)
+- [Persistencia e idempotencia](#persistencia-e-idempotencia)
 - [Reglas de negocio](#reglas-de-negocio)
   - [Mapeo Merchant → Client / Warehouse](#mapeo-merchant--client--warehouse)
   - [Return interno vs externo](#return-interno-vs-externo)
@@ -37,30 +38,44 @@ correcta del depósito y moviéndolo a la caja física que usó el operario.
 ```
                   ┌──────────────────────────────────────────────┐
   Two Boxes  ───► │  POST /webhook   (listener.py, Flask)        │
-  return-complete │  auth: header x-two-boxes-authorization      │
+  return-complete │  auth: hmac.compare_digest sobre el header   │
+                  │        x-two-boxes-authorization             │
                   └───────────────┬──────────────────────────────┘
+                                  │
+                     ┌────────────▼─────────────┐
+                     │  filtro de event_type    │  no soportado → se archiva
+                     │  claim de idempotencia   │  ya visto      → se archiva
+                     │  (storage/event_store)   │  return creado → alerta
+                     └────────────┬─────────────┘
                                   │ responde 200 inmediatamente
-                    ┌─────────────┴──────────────┐
-                    ▼                            ▼
-      ThreadPoolExecutor (10)         ThreadPoolExecutor (10)
-      enviar_a_google_async           procesar_webhook
-              │                                │
-              ▼                                ▼
-      Google Apps Script          MintsoftReturnService
-        (GAS_URL — archivo        (services/mintsoft_service.py)
-         del payload crudo)                    │
-                                    ┌──────────┴───────────┐
-                                    ▼                      ▼
-                          MintsoftOrderClient       canales de error
-                          (clients/…Client.py)                                    │               └─ mail de alerta SMTP
-                                    ▼
-                            api.mintsoft.co.uk
+              ┌───────────────────┴──────────────────┐
+              ▼                                      ▼
+   archivo_executor (4 threads)        executor (10 threads)
+   enviar_a_google_async               procesar_webhook
+   enviar_webhook_por_sku                      │
+              │                                ▼
+              ▼                      MintsoftReturnService
+      Google Apps Script             (services/mintsoft_service.py)
+        (GAS_URL / WEBHOOKS_URL                 │
+         — archivo del payload)      ┌──────────┴───────────┐
+                                     ▼                      ▼
+                           MintsoftOrderClient        reporte de errores
+                           (clients/…Client.py)       (1 mail por webhook)
+                                     ▼
+                             api.mintsoft.co.uk
 ```
 
-El endpoint es **fire-and-forget**: valida el secreto compartido, entrega el payload a dos
-threads en segundo plano y responde `200` con body vacío. Por lo tanto Two Boxes nunca ve
-los fallos de procesamiento — esos se reportan por fuera del request (Google Sheet + mail),
-ver [Manejo de errores](#manejo-de-errores).
+El endpoint es **fire-and-forget**: valida el secreto compartido, decide si el evento se
+procesa, entrega el trabajo a threads en segundo plano y responde `200` con body vacío. Por
+lo tanto Two Boxes nunca ve los fallos de procesamiento — esos se reportan por fuera del
+request (Google Sheet + mail), ver [Manejo de errores](#manejo-de-errores).
+
+**Los dos pools están separados a propósito.** Antes los tres trabajos compartían un único
+`ThreadPoolExecutor(10)`: el archivado a Google tiene timeouts de 60 y 120 segundos, así que
+unos pocos eventos con Apps Script lento se quedaban con todos los threads y el
+procesamiento en Mintsoft — lo único que no se puede perder ni reintentar sin riesgo —
+quedaba encolado detrás del archivado. Se dimensionan con `WORKERS_MINTSOFT` y
+`WORKERS_ARCHIVO`.
 
 ---
 
@@ -88,9 +103,12 @@ ver [Manejo de errores](#manejo-de-errores).
 ## Estructura del repositorio
 
 ```
-listener.py                       App Flask, auth del webhook, dispatch de threads
+listener.py                       App Flask, auth, idempotencia, dispatch de threads
+config.py                         Toda la configuración: ids de location, reasons,
+                                  estados returnables, pools, flags del store
 Procfile                          Entrypoint de gunicorn
 requirements.txt
+.env.example                      Todas las variables de entorno, documentadas
 
 clients/
   mintsoftClient.py               MintsoftOrderClient — wrapper HTTP sobre la API de Mintsoft
@@ -98,36 +116,77 @@ services/
   mintsoft_service.py             MintsoftReturnService — toda la lógica de negocio
 mappers/
   mintsoft_mapper.py              Tabla nombre de merchant → ClientId / WarehouseId de Mintsoft
+storage/
+  event_store.py                  Registro persistente de webhooks: idempotencia (E-1)
 loggers/
   main_logger.py                  Factory de logger a stdout
 models/                           Payloads de ejemplo capturados y datos de referencia de Mintsoft (ver abajo)
-tests/                            Casos de las rutas de error (pytest)
+tests/                            79 tests (pytest). Corren en CI, sin tocar la red.
+.github/workflows/ci.yml          Compila todo + corre los tests en cada push y PR
 ```
+
+**Nada de ids de Mintsoft escritos a mano en la lógica.** Las locations (`4104`, `4299`, `9`,
+`4304`), los `ReturnReasonId` y los estados de orden returnables viven en `config.py`, con un
+default igual al comportamiento de producción y una variable de entorno para cambiarlos sin
+deploy. Antes las locations aparecían hardcodeadas en cinco bloques distintos de
+`services/mintsoft_service.py`.
 
 ---
 
 ## Variables de entorno
 
-| Variable | Requerida | Usada por | Propósito |
-|---|---|---|---|
-| `WEBHOOK_SECRET` | ✅ | `listener.py` | Valor esperado del header `x-two-boxes-authorization`. Si no coincide → `401`. |
-| `MINTSOFT_USERNAME` | ✅ | `clients/mintsoftClient.py` | Usuario para `POST /api/Auth` de Mintsoft. Si falta → `RuntimeError` al importar. |
-| `MINTSOFT_PASSWORD` | ✅ | `clients/mintsoftClient.py` | Contraseña de Mintsoft. |
-| `GAS_URL` | ✅ | `listener.py` | Endpoint de Google Apps Script que archiva cada payload crudo del webhook. |
-| `PORT` | – | `listener.py` | Puerto del servidor de desarrollo / gunicorn. Default `8080`. |
-| `SMTP_HOST` | – | service | Servidor SMTP para los mails de alerta. Si falta alguna variable SMTP, las alertas se saltean con un warning. |
-| `SMTP_PORT` | – | service | Default `587`. |
-| `SMTP_USER` | – | service | Login SMTP; también el `From` por defecto. |
-| `SMTP_PASSWORD` | – | service | Contraseña SMTP. |
-| `ALERT_EMAIL_FROM` | – | service | Sobreescribe la dirección `From`. |
-| `LOG_LEVEL` | – | `loggers/main_logger.py` | Default `INFO`. Los logs van a stdout. |
-| `LOG_LEVEL` | – | logger | Default `INFO`. |
+`.env.example` tiene la lista completa con comentarios. Resumen:
 
-`clients/mintsoftClient.py` llama a `load_dotenv()`, así que un archivo `.env` local funciona.
+**Requeridas**
 
-> ⚠️ `ALERT_EMAIL_TO` aparece documentada en un mensaje de warning pero **no** se lee del
-> entorno — la lista de destinatarios está hardcodeada en `MintsoftReturnService.__init__`.
-> Ver [comportamientos conocidos](#notas-operativas-y-comportamientos-conocidos).
+| Variable | Usada por | Propósito |
+|---|---|---|
+| `WEBHOOK_SECRET` | `listener.py` | Valor esperado del header `x-two-boxes-authorization`, comparado con `hmac.compare_digest`. Si no coincide → `401`. **Si no está seteada se rechaza todo.** |
+| `MINTSOFT_USERNAME` | `clients/mintsoftClient.py` | Usuario para `POST /api/Auth`. Si falta → `RuntimeError` al importar. |
+| `MINTSOFT_PASSWORD` | `clients/mintsoftClient.py` | Contraseña de Mintsoft. |
+
+**Persistencia e idempotencia** — ver [esa sección](#persistencia-e-idempotencia)
+
+| Variable | Default | Propósito |
+|---|---|---|
+| `DATABASE_URL` | – | Postgres del store de eventos. **Es lo que corresponde en producción**: es el único backend que sobrevive a un deploy y que comparten varias instancias. Sin ella se usa SQLite. |
+| `STORE_PATH` | `webhook_events.db` | Ruta del SQLite cuando no hay `DATABASE_URL`. |
+| `REQUIRE_STORE` | `true` | Si el store no responde, **no** se escribe en Mintsoft: el evento se archiva y sale un mail. En `false` se procesa a riesgo de duplicar. |
+| `PERSIST_PAYLOAD` | `true` | Guardar el payload completo permite reprocesar desde la base. Incluye datos del comprador. |
+| `CLAIM_STALE_SECONDS` | `1800` | Un claim abierto más tiempo que esto se considera colgado y se puede retomar. |
+| `DUPLICATE_REFERENCE_ACTION` | `warn` | Qué hacer con un evento nuevo cuya `Reference` ya tiene un return: `warn` \| `block` \| `off`. |
+
+**Comportamiento de negocio**
+
+| Variable | Default | Propósito |
+|---|---|---|
+| `EVENT_TYPES` | `return-complete` | Tipos de evento que se procesan en Mintsoft. El resto se archiva y avisa. |
+| `RETURNABLE_ORDER_STATUS_IDS` | `4,5,6` | Estados que habilitan un return interno (DESPATCHED / INVOICED / INVOICEFAILED). |
+| `RETURN_LOCATIONS` | ver `config.py` | Override JSON de las locations por warehouse: `{"3":{"good":4104,"quarantine":9},"5":{"good":4299,"quarantine":4304}}`. |
+| `SOURCE_LOCATION_GOOD` | `RET` | Origen del `TransferStock` para stock vendible. |
+| `SOURCE_LOCATION_QUARANTINE` | `RET-TEMP` | Origen del `TransferStock` para stock en cuarentena. |
+| `GOOD_STOCK_DISPOSITIONS` | `Return to Stock` | Dispositions que vuelven a stock vendible. |
+| `MISSING_DISPOSITION` | `Missing` | Disposition de la unidad que nunca llegó. |
+| `RETURN_REASON_GOOD` / `RETURN_REASON_QUARANTINE` | `1` / `2` | `ReturnReasonId` de Mintsoft. |
+| `REFERENCE_MAX_LEN` | `50` | Largo máximo de `Reference` que acepta Mintsoft. |
+| `MAX_CONTENT_LENGTH` | `5242880` | Tamaño máximo del body, rechazado antes de parsearlo. |
+
+**Notificaciones, pools y runtime**
+
+| Variable | Default | Propósito |
+|---|---|---|
+| `GAS_URL` | – | Apps Script que archiva el payload crudo. Sin ella no se archiva (se loguea en `debug`). |
+| `WEBHOOKS_URL` | – | Apps Script que recibe una notificación por SKU. |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | – / `587` / – / – | SMTP de las alertas. Si falta alguna, las alertas se saltean con un warning. |
+| `ALERT_EMAIL_FROM` | `SMTP_USER` | Dirección `From`. |
+| `ALERT_EMAIL_TO` | lista del equipo | Destinatarios, separados por comas. **La leen tanto el service como el mapper**, así que hay una sola lista. |
+| `ALERT_THROTTLE_SECONDS` | `1800` | Ventana de agrupación de alertas repetidas del mapper. |
+| `WORKERS_MINTSOFT` / `WORKERS_ARCHIVO` | `10` / `4` | Tamaño de cada pool de threads. |
+| `PORT` | `8080` | Puerto del servidor. |
+| `LOG_LEVEL` | `INFO` | Nivel de log. Todo va a stdout. |
+
+`clients/mintsoftClient.py` y `listener.py` llaman a `load_dotenv()`, así que un archivo
+`.env` local funciona.
 
 ---
 
@@ -161,8 +220,15 @@ print(r.status_code)
 PY
 ```
 
-Como el procesamiento es asincrónico, hay que mirar `logs/m_service.log` (y stdout) para ver
-el resultado.
+Como el procesamiento es asincrónico, el resultado se ve en **stdout** (el servicio no
+escribe logs a archivo). Ojo: reenviar el mismo payload dos veces procesa **una** sola vez,
+por diseño — para volver a procesarlo hay que cambiarle el `id` o borrar su fila del store.
+
+Correr los tests (no tocan la red: Mintsoft, SMTP y Google están stubeados):
+
+```bash
+python3 -m pytest tests/ -q
+```
 
 ---
 
@@ -177,6 +243,24 @@ el resultado.
 | `200` | Aceptado (body vacío). **No significa que Mintsoft haya funcionado.** |
 | `400` | Body ausente o JSON no parseable |
 | `401` | Header de auth ausente o incorrecto |
+| `413` | Body más grande que `MAX_CONTENT_LENGTH` |
+
+Un `200` puede significar cuatro cosas distintas, y el log lo dice en cada caso: se encoló
+para procesar, el `event_type` no está soportado, el evento ya se había procesado, o el store
+de idempotencia no responde. Nunca se devuelve `5xx` por un fallo de procesamiento: eso haría
+que Two Boxes reintente, y el reintento no arregla nada.
+
+### `GET /health`
+
+No toca Mintsoft: tiene que responder justo cuando el WMS está caído. Devuelve `200` con
+`status: ok`, o `503` con `status: degraded` cuando el store no está disponible y
+`REQUIRE_STORE=true` — es decir, cuando el servicio no puede garantizar que no duplique
+returns. Incluye la configuración efectiva (locations, estados returnables, flags) y los
+contadores del proceso: `recibidos`, `procesados`, `fallados`, `duplicados`, `ignorados`,
+`sin_store`.
+
+> Los contadores son **por proceso**: con `--workers 2` cada worker tiene los suyos. Los
+> totales reales están en el store (`store.por_estado`), que sí es compartido.
 
 ### Campos del payload que realmente se consumen
 
@@ -199,6 +283,76 @@ Se soportan dos formas de payload. Los ejemplos completos están en `models/`
 | `line_items[].put_away_bin` | Código de la caja de destino |
 | `line_items[].photo_urls` | Se envía como `ReturnPhotos` (solo returns internos) |
 | `line_items[].graded_attributes[0].merchant_grading_attribute.grading_attribute.title` | Se copia en el campo `Comments` del item (solo returns internos) |
+
+---
+
+## Persistencia e idempotencia
+
+`storage/event_store.py`. Cada webhook que llega tiene una fila en una base, y esa fila es lo
+que decide si se procesa o no.
+
+### Por qué
+
+La única protección anterior era un `OrderedDict` en memoria del proceso, y fallaba en los
+tres casos que importan:
+
+1. **Se perdía en cada reinicio y en cada deploy.**
+2. **No se compartía entre los workers de gunicorn** (`--workers 2`): el mismo evento que
+   cayera en el otro worker pasaba de largo.
+3. **No recordaba que el return ya se había creado.** Un reproceso a mano creaba un
+   **segundo return en Mintsoft con el mismo stock** — el caso de la orden W836.
+
+### Cómo
+
+La clave de idempotencia es el `id` que manda Two Boxes; si el payload no lo trae, la huella
+SHA-256 del payload canonicalizado (con las claves ordenadas, así que un reenvío
+re-serializado da la misma huella).
+
+El paso clave es **cuándo** se graba el `return_id`: en el instante en que Mintsoft lo
+devuelve, *antes* de agregar items y mover stock (`_registrar_return`). Así, si el webhook
+muere a mitad de camino, la fila ya dice que el return existe.
+
+Al llegar un evento, el `claim` es atómico (`INSERT … ON CONFLICT DO NOTHING`) y devuelve uno
+de estos veredictos:
+
+| Veredicto | Qué pasó | Se procesa |
+|---|---|---|
+| `nuevo` | Primera vez que se ve | ✅ |
+| `reintento` | Falló antes de crear el return: no hay nada que duplicar | ✅ |
+| `retomado_colgado` | El claim quedó abierto más de `CLAIM_STALE_SECONDS` (murió el worker) | ✅ |
+| `ya_procesado` | Terminó bien antes | ❌ |
+| `return_ya_creado` | **El return existe en Mintsoft.** Reprocesar crearía un segundo | ❌ + alerta |
+| `en_proceso` | Otro worker lo tomó y sigue dentro de la ventana | ❌ |
+| `carrera_perdida` | Dos workers lo retomaron a la vez; ganó el otro | ❌ |
+| `store_caido` | La base no responde | según `REQUIRE_STORE` |
+
+**Segunda red:** si llega un evento *nuevo* cuya `Reference` ya tiene un return creado por
+otro evento, se avisa por mail. Por defecto se procesa igual
+(`DUPLICATE_REFERENCE_ACTION=warn`), porque una misma orden puede tener dos devoluciones
+legítimas en momentos distintos y ahí la `Reference` cae al número de orden. Con
+`DUPLICATE_REFERENCE_ACTION=block` no se crea el segundo return.
+
+### Backends
+
+| Backend | Cuándo | Sobrevive al reinicio | Sobrevive al deploy | Compartido entre instancias |
+|---|---|---|---|---|
+| **Postgres** (`DATABASE_URL`) | Producción | ✅ | ✅ | ✅ |
+| **SQLite** (`STORE_PATH`) | Desarrollo, CI, fallback | ✅ | ❌ (disco efímero) | Solo dentro del mismo contenedor |
+
+SQLite abre en modo WAL para que los dos workers de gunicorn puedan leer mientras uno
+escribe. Alcanza para que `--workers 2` no duplique, pero **no** para sobrevivir un deploy:
+si el reproceso de un evento viejo tiene que estar protegido, hace falta `DATABASE_URL`.
+
+### Qué cambió para operar
+
+La regla anterior era *"no reenviar webhooks a mano hasta que exista la persistencia"*. **Ya
+no aplica.** Reenviar un webhook ahora es seguro: si el return ya se creó, el servicio lo
+detecta, no crea otro, y manda un mail diciendo que hay que completar ese return a mano
+desde Mintsoft.
+
+Lo que **no** hace es arreglar el return a medio armar. `return_ya_creado` significa "el
+return existe pero probablemente le faltan items o el movimiento de stock" — eso sigue siendo
+trabajo manual.
 
 ---
 
@@ -273,12 +427,22 @@ segundos alrededor de la llamada para darle tiempo a Mintsoft a indexarlo.
 | `Missing` | — | el item nunca llegó → **se saltea por completo** | — |
 | cualquier otro valor | `2` — *Faulty or Damaged - Quarantine Stock* (`Quarantine`) | dañado | `RET-TEMP` |
 
-Los ids de ubicación están hardcodeados por depósito:
+Los ids de ubicación salen de `config.RETURN_LOCATIONS` (`config.location_id()`), con estos
+defaults por depósito:
 
-| Propósito | Wholesale (wh 3) | E-Commerce (wh 5) |
-|---|---|---|
-| `RET` — staging de stock bueno, y destino de **todas** las cajas | `4104` | `4299` |
-| `RET-TEMP` — staging de cuarentena | `9` | `4304` |
+| Propósito | Clave | Wholesale (wh 3) | E-Commerce (wh 5) |
+|---|---|---|---|
+| `RET` — staging de stock bueno, y destino de **todas** las cajas | `good` | `4104` | `4299` |
+| `RET-TEMP` — staging de cuarentena | `quarantine` | `9` | `4304` |
+
+Se cambian con `RETURN_LOCATIONS` (JSON) sin tocar código, y con la misma variable se habilita
+un depósito nuevo.
+
+> **Un warehouse desconocido ahora lanza**, no adivina. El código anterior resolvía la
+> ubicación con `if warehouse == 3: … else: …`, así que un `warehouse` nuevo — o `None`, que
+> es lo que devuelve `map_warehouse` para un merchant no mapeado — caía en silencio en las
+> locations de E-Commerce, que son de otro depósito. Hoy eso es un
+> `config.LocationDesconocida` que se reporta.
 
 **La cuarentena la aplica Mintsoft solo, al confirmar el return.** El motivo
 `ReturnReasonId=2` tiene `StockAction='Quarantine'` (ver `GET /api/Return/Reasons`), y el
@@ -521,22 +685,32 @@ Mintsoft son de un solo intento.
 
 ## Logging
 
-`loggers/main_logger.py` construye un logger con un `StreamHandler a stdout`
-(`logs/m_service.log`, 10 MB × 5 backups) y un stream handler, con el formato:
+`loggers/main_logger.py` construye un logger con un único `StreamHandler` a **stdout**, con
+el formato:
 
 ```
 %(asctime)s | %(levelname)s | %(name)s | %(message)s
 ```
 
-El logger del servicio se llama `mintsoft_service`. Tener en cuenta que buena parte del
-diagnóstico también sale por `print()` sueltos, tanto en el cliente como en el listener, así
-que el stdout del contenedor es la vista más completa.
+Los loggers son `listener`, `mintsoft_service`, `mintsoft_client`, `mintsoft_mapper` y
+`event_store`. **Todo el diagnóstico pasa por el logger**: no quedan `print()` sueltos, así
+que el log agregado de la plataforma tiene la historia completa, con nivel y timestamp.
+
+No se escribe a archivo a propósito: el parámetro `log_file` se acepta por compatibilidad con
+los callers pero se ignora. En un PaaS ese archivo vive en el disco efímero del contenedor, se
+pierde en cada deploy y nadie lo lee, mientras que stdout sí va al log agregado.
+
+Los datos personales del comprador (`customer`, `rma_address`) se redactan antes de loguear el
+payload (`_redactar_pii`). El `tracking_number` **no** se redacta: es el PO reference con el
+que se busca el return en Mintsoft, así que sin él los logs no sirven para operar.
 
 ---
 
 ## Datos de referencia (`models/`)
 
-Fixtures capturados, útiles para reproducir casos y para buscar los ids hardcodeados.
+Fixtures capturados. Los tres payloads de Two Boxes se usan como casos base en
+`tests/test_payloads_reales.py`, así que cualquier cambio que rompa una de estas formas falla
+en CI.
 
 | Archivo | Contenido |
 |---|---|
@@ -591,12 +765,17 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
     `event_data["customer"]` dentro del propio `except`, así que con una lista vacía o un
     `customer` ausente **lanzaban dentro del handler y tapaban el error real** — que es
     exactamente cómo se perdió la causa de una falla de producción.
-12. **Dos `sleep` de 3 segundos** rodean la creación de productos al vuelo, ocupando un thread
-    del pool de 10 slots por más de 6 segundos por cada SKU nuevo.
+12. **Un `sleep` de 3 segundos** después de crear un producto al vuelo, para no saturar la
+    API de Mintsoft. Ocupa un thread del pool por SKU nuevo. Antes eran dos (uno por rama),
+    porque cada camino daba de alta el producto por su cuenta; hoy las dos ramas usan
+    `_resolver_product_id`.
 13. **El `event_type` se filtra en el listener.** Solo los tipos de `EVENT_TYPES`
     (default `return-complete`) se procesan en Mintsoft; el resto se archiva y se saltea.
-14. **Los ids de ubicación, de warehouse y de return reason están hardcodeados.** Si se
-    renombran o recrean ubicaciones en Mintsoft, hay que editar `services/mintsoft_service.py`.
+14. **Los ids de ubicación y de return reason ya no están hardcodeados.** Viven en
+    `config.py` y se cambian con `RETURN_LOCATIONS`, `RETURN_REASON_GOOD` y
+    `RETURN_REASON_QUARANTINE`, sin editar código. Antes las locations aparecían escritas a
+    mano en cinco bloques distintos de `services/mintsoft_service.py`, y un `warehouse`
+    desconocido caía en silencio en las de E-Commerce; hoy eso lanza.
 15. **Los items con barcode de 7 caracteres o menos y SKU no encontrado se arreglan a mano.** El
     fallback `SearchBarcode` está deshabilitado a propósito para esos casos por una limitación del
     endpoint de Mintsoft (matchea parcial y devuelve el producto equivocado). El return se crea
@@ -609,16 +788,19 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
     todas. Ahora los items caídos se juntan y, al final, se loguea un error y se manda un mail de
     alerta con el detalle (`items_agregados` / `items_en_el_payload` / `items_caidos`). El return
     igual queda confirmado y corto: la corrección es manual.
-17. **No hay idempotencia.** `create_return` nunca chequea si ya existe un return en Mintsoft para
-    esa orden o ese tracking number. Si Two Boxes manda dos eventos `return-complete` para el
-    mismo return físico — o reintenta una entrega — se crean **dos returns separados** en Mintsoft.
-    Como los payloads de RMA traen varios `line_items` con el mismo `tracking_number` y los de
-    Work Capture traen uno solo, dos eventos para el mismo return físico es un escenario real.
+17. **Hay idempotencia persistente.** Cada evento tiene una fila en
+    `storage/event_store.py` y el `return_id` se graba en el instante en que Mintsoft lo crea,
+    así que un reintento de Two Boxes o un reproceso a mano **no** crea un segundo return. Ver
+    [Persistencia e idempotencia](#persistencia-e-idempotencia). Lo que queda como límite: con
+    SQLite el registro se pierde en cada deploy, así que para proteger el reproceso de eventos
+    viejos hace falta `DATABASE_URL`.
 
-18. **La `ms-apikey` vence a las 24 horas y no se renueva.** El spec de `POST /api/Auth` lo dice
-    explícitamente. `MintsoftOrderClient` la pide una sola vez en el constructor y `listener.py`
-    instancia el service a nivel de módulo, así que cualquier worker con más de un día de uptime
-    empieza a devolver `401` en todas las llamadas hasta que se redespliegue. **Pendiente.**
+18. **La `ms-apikey` se renueva sola.** Vence a las 24 horas (lo dice el spec de
+    `POST /api/Auth`). `MintsoftOrderClient` ya no la pide en el constructor: la pide en la
+    primera llamada real y la renueva ante un `401`, reintentando el request una vez. Un `401`
+    significa que la key expiró y que el request no llegó a ejecutarse del lado de Mintsoft, así
+    que reintentarlo no puede duplicar nada. De paso, si Mintsoft está caída la aplicación
+    igual levanta: antes el worker moría en el import.
 19. **`create_product` no envía `Weight`**, que el schema `Product` marca como requerido junto
     con `SKU`. Se mandan solo SKU, Name, EAN y ClientId, así que crear un SKU al vuelo durante un
     return externo puede volver con `Success: false`. **Pendiente.**
@@ -628,9 +810,9 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
     sin `line_items` devolvía `""` y disparaba la alerta de "cliente no mapeado" con el nombre
     vacío, aunque el merchant estuviera en el payload al lado. `map_client` ahora distingue los
     dos casos: con nombre vacío manda "Payload sin merchant".
-21. **`listener.py` no mira `event_type`.** Todo `POST` a `/webhook` va a `procesar_webhook`, sea
-    `return-complete` o cualquier otro tipo que Two Boxes mande, y los otros tipos pueden tener
-    otra forma de payload.
+21. **Los dos pools de threads están separados.** El archivado a Google no comparte threads
+    con el procesamiento en Mintsoft (`WORKERS_ARCHIVO` / `WORKERS_MINTSOFT`), así que un Apps
+    Script lento ya no demora el WMS. Ver [Arquitectura](#arquitectura).
 
 ### Agregar un merchant
 
@@ -638,5 +820,9 @@ Documentados tal cual están; cada punto es un comportamiento real del código a
    merchant de Two Boxes en `tb_name` (en minúsculas), el client id de Mintsoft en `m_id`, y
    `warehouse_id` `3` (Wholesale) o `5` (E-Commerce).
 2. Si el merchant vende por los dos canales, agregar **dos** filas con `tb_name` distintos.
-3. Verificar que las ubicaciones `RET` / `RET-TEMP` del merchant coincidan con los ids
-   hardcodeados para ese depósito; si no, hay que parametrizar las constantes de ubicación.
+3. Verificar que las ubicaciones `RET` / `RET-TEMP` del depósito estén en
+   `config.RETURN_LOCATIONS`. Si el merchant va a un depósito nuevo, agregarlo con la variable
+   de entorno `RETURN_LOCATIONS` — no hace falta tocar código, pero sí reiniciar el servicio.
+   Un warehouse sin locations configuradas falla con `LocationDesconocida` y lo reporta, en vez
+   de ubicar el stock en el depósito equivocado.
+4. Correr `python3 -m pytest tests/ -q` antes de mergear: CI corre lo mismo.

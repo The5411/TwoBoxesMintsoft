@@ -2,9 +2,18 @@
 import os
 import sys
 import smtplib
+import tempfile
 
 RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
+
+# El store de eventos va a una base temporal, NO a webhook_events.db del repo:
+# los tests no pueden ensuciar (ni depender de) el estado de desarrollo.
+# Se setea antes de importar cualquier modulo del proyecto, porque config.py lee
+# el entorno al importarse.
+_DIR_STORE = tempfile.mkdtemp(prefix="tb-store-")
+os.environ["STORE_PATH"] = os.path.join(_DIR_STORE, "eventos.db")
+os.environ.pop("DATABASE_URL", None)
 
 os.environ.setdefault("MINTSOFT_USERNAME", "test")
 os.environ.setdefault("MINTSOFT_PASSWORD", "test")
@@ -40,7 +49,15 @@ def sin_red(monkeypatch):
     import services.mintsoft_service as ms
     monkeypatch.setattr(ms.time, "sleep", lambda *_: None)
 
+    # El throttle de alertas es estado de modulo: sin limpiarlo, el primer test
+    # que manda una alerta suprime la del siguiente durante 30 minutos.
+    import mappers.mintsoft_mapper as mm
+    mm._alert_last_sent.clear()
+
     import listener
+    # Cada test arranca con el store vacio: si no, el claim del segundo test ve
+    # el evento del primero y no procesa nada.
+    limpiar_store(listener.event_store)
     respuesta_ok = type("R", (), {
         "status_code": 200,
         "raise_for_status": lambda self: None,
@@ -50,6 +67,34 @@ def sin_red(monkeypatch):
     monkeypatch.setattr(listener.requests, "post", lambda *a, **k: respuesta_ok())
     listener.MAILS = enviados
     yield enviados
+
+
+def limpiar_store(store):
+    """Borra todas las filas del store. Los tests comparten el archivo."""
+    con = store._conectar()
+    try:
+        con.cursor().execute("DELETE FROM webhook_events")
+        con.commit()
+    finally:
+        con.close()
+
+
+def procesar_en_background(cuerpo, headers=None):
+    """Postea a /webhook y espera a que los dos pools terminen.
+
+    Devuelve la respuesta HTTP. Reemplaza los pools despues de esperarlos,
+    porque un ThreadPoolExecutor apagado no acepta mas trabajo.
+    """
+    import concurrent.futures
+    import listener
+
+    http = listener.app.test_client()
+    r = http.post("/webhook", json=cuerpo,
+                  headers=headers or {"x-two-boxes-authorization": "test-secret"})
+    for nombre in ("executor", "archivo_executor"):
+        getattr(listener, nombre).shutdown(wait=True)
+        setattr(listener, nombre, concurrent.futures.ThreadPoolExecutor(max_workers=4))
+    return r
 
 
 @pytest.fixture
@@ -98,12 +143,19 @@ class ClienteFalso:
     """Mintsoft simulado. Los flags cambian el camino que se quiere ejercitar."""
 
     def __init__(self, orden_existe=True, add_item_ok=True, transfer_ok=True,
-                 buscar_orden_falla=False, producto_id=1):
+                 buscar_orden_falla=False, producto_id=1, allocate_ok=True,
+                 order_status_id=4):
         self.orden_existe = orden_existe
         self.add_item_ok = add_item_ok
         self.transfer_ok = transfer_ok
         self.buscar_orden_falla = buscar_orden_falla
         self.producto_id = producto_id
+        # allocate_ok=False simula el caso W836: el return SI se crea en Mintsoft
+        # y el paso siguiente falla, dejando el return a medio armar.
+        self.allocate_ok = allocate_ok
+        # 4 = DESPATCHED. Un estado fuera de RETURNABLE_ORDER_STATUS_IDS hace que
+        # la orden exista pero no habilite un return interno.
+        self.order_status_id = order_status_id
         self.llamadas = []
 
     def search_orders(self, termino, **k):
@@ -112,8 +164,13 @@ class ClienteFalso:
             raise RuntimeError("Order/Search: timeout contra Mintsoft")
         if not self.orden_existe:
             return []
-        return [{"ID": 77, "ClientId": 110, "OrderNumber": "A1",
-                 "ExternalOrderReference": "#A1", "OrderStatusId": 4}]
+        # Devuelve una orden que matchea el termino buscado, como hace Mintsoft.
+        # Antes devolvia siempre 'A1', asi que cualquier payload con otro numero
+        # de orden -- los fixtures reales de models/, por ejemplo -- caia en el
+        # camino de return externo sin que el test lo dijera.
+        return [{"ID": 77, "ClientId": 110, "OrderNumber": termino,
+                 "ExternalOrderReference": termino,
+                 "OrderStatusId": self.order_status_id}]
 
     def get_product_id(self, sku, client_id, barcode):
         self.llamadas.append(("get_product_id", sku))
@@ -135,7 +192,10 @@ class ClienteFalso:
         return {"Success": True, "ID": 9}
 
     def allocate_return_item_location(self, rid, d):
-        self.llamadas.append(("allocate", d.get("LocationId"))); return {"Success": True}
+        self.llamadas.append(("allocate", d.get("LocationId")))
+        if not self.allocate_ok:
+            raise RuntimeError("Mintsoft rechazo AllocateItemLocation")
+        return {"Success": True}
 
     def confirm_return(self, rid):
         self.llamadas.append(("confirm_return", rid)); return {"Success": True}

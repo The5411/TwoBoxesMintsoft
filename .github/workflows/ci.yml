@@ -17,6 +17,6 @@ jobs:
           python-version-file: .python-version
       - run: pip install -r requirements.txt pytest
       - name: Compilar todo (detecta SyntaxError antes del deploy)
-        run: python -m compileall -q listener.py clients services mappers loggers
+        run: python -m compileall -q listener.py config.py clients services mappers loggers storage
       - name: Tests
         run: python -m pytest tests/ -q
