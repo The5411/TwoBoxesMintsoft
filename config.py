@@ -237,11 +237,14 @@ PERSIST_PAYLOAD = _env_bool("PERSIST_PAYLOAD", True)
 CLAIM_STALE_SECONDS = _env_int("CLAIM_STALE_SECONDS", 1800)
 
 # Que hacer cuando llega un evento NUEVO cuya Reference ya tiene un return creado.
-#   warn  -> se procesa, pero avisa por mail (default)
-#   block -> no se crea un segundo return
+#   warn  -> se procesa igual y queda SOLO en el log, sin mail (default)
+#   block -> no se crea un segundo return, y SI manda mail
 #   off   -> no se chequea
 # No es 'block' por default porque una misma orden puede tener dos devoluciones
 # legitimas en momentos distintos, y ahi la Reference cae al numero de orden.
+# Por ese mismo motivo 'warn' no manda mail: daba demasiados falsos positivos.
+# 'block' si manda, porque ahi el return NO se crea y eso no puede pasar en
+# silencio.
 DUPLICATE_REFERENCE_ACTION = os.environ.get(
     "DUPLICATE_REFERENCE_ACTION", "warn"
 ).strip().lower()

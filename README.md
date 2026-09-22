@@ -155,7 +155,7 @@ deploy. Antes las locations aparecían hardcodeadas en cinco bloques distintos d
 | `REQUIRE_STORE` | `true` | Si el store no responde, **no** se escribe en Mintsoft: el evento se archiva y sale un mail. En `false` se procesa a riesgo de duplicar. |
 | `PERSIST_PAYLOAD` | `true` | Guardar el payload completo permite reprocesar desde la base. Incluye datos del comprador. |
 | `CLAIM_STALE_SECONDS` | `1800` | Un claim abierto más tiempo que esto se considera colgado y se puede retomar. |
-| `DUPLICATE_REFERENCE_ACTION` | `warn` | Qué hacer con un evento nuevo cuya `Reference` ya tiene un return: `warn` \| `block` \| `off`. |
+| `DUPLICATE_REFERENCE_ACTION` | `warn` | Qué hacer con un evento nuevo cuya `Reference` ya tiene un return. `warn`: se procesa igual y queda solo en el log, **sin mail**. `block`: no se crea el segundo return, **y avisa por mail**. `off`: ni se consulta. |
 
 **Comportamiento de negocio**
 
@@ -328,10 +328,14 @@ de estos veredictos:
 | `store_caido` | La base no responde | según `REQUIRE_STORE` |
 
 **Segunda red:** si llega un evento *nuevo* cuya `Reference` ya tiene un return creado por
-otro evento, se avisa por mail. Por defecto se procesa igual
-(`DUPLICATE_REFERENCE_ACTION=warn`), porque una misma orden puede tener dos devoluciones
-legítimas en momentos distintos y ahí la `Reference` cae al número de orden. Con
-`DUPLICATE_REFERENCE_ACTION=block` no se crea el segundo return.
+otro evento, queda registrado en el log. Por defecto se procesa igual
+(`DUPLICATE_REFERENCE_ACTION=warn`) **y no se manda mail**: una misma orden puede tener dos
+devoluciones legítimas en momentos distintos — y ahí la `Reference` cae al número de orden —,
+así que el aviso daba demasiados falsos positivos y no agregaba nada sobre la línea de log.
+
+Con `DUPLICATE_REFERENCE_ACTION=block` no se crea el segundo return, y **ese caso sí manda
+mail**: ahí la devolución no queda registrada en ningún lado, y un return que no se crea sin
+que nadie se entere es una devolución perdida.
 
 ### Backends
 

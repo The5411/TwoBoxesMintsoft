@@ -198,8 +198,14 @@ def test_con_REQUIRE_STORE_false_se_procesa_a_riesgo(mails, monkeypatch):
 
 
 # ------------------------------------------- segunda red: misma Reference, otro id
-def test_otro_evento_con_la_misma_reference_avisa(mails, monkeypatch):
-    """Dos eventos distintos apuntando al mismo return: se avisa (default warn)."""
+def test_con_warn_se_procesa_y_NO_sale_mail(mails, monkeypatch):
+    """Dos eventos distintos apuntando al mismo return.
+
+    Con 'warn' (el default) se procesa igual y queda SOLO en el log: una misma
+    orden puede tener dos devoluciones legitimas en momentos distintos, asi que
+    este aviso daba muchos falsos positivos y el mail no agregaba nada sobre la
+    linea de log.
+    """
     monkeypatch.setattr(config, "DUPLICATE_REFERENCE_ACTION", "warn")
     cli = ClienteFalso()
     listener.return_service.client = cli
@@ -209,7 +215,8 @@ def test_otro_evento_con_la_misma_reference_avisa(mails, monkeypatch):
     procesar_en_background(payload(event_id="ref-2"))  # misma TRK-999
 
     assert len(cli.hizo("create_return")) == 2, "con 'warn' se procesa igual"
-    assert any("duplicado" in m["Subject"].lower() for m in mails)
+    assert mails == [], \
+        f"con 'warn' no tiene que salir mail: {[m['Subject'] for m in mails]}"
 
 
 def test_con_block_no_se_crea_el_segundo_return(mails, monkeypatch):
@@ -222,6 +229,34 @@ def test_con_block_no_se_crea_el_segundo_return(mails, monkeypatch):
 
     assert len(cli.hizo("create_return")) == 1, \
         "con 'block' el segundo evento no crea otro return"
+
+
+def test_con_block_SI_sale_mail(mails, monkeypatch):
+    """Con 'block' el return no se crea, y eso no puede pasar en silencio: un
+    return que no se crea sin que nadie se entere es una devolucion perdida."""
+    monkeypatch.setattr(config, "DUPLICATE_REFERENCE_ACTION", "block")
+    cli = ClienteFalso()
+    listener.return_service.client = cli
+
+    procesar_en_background(payload(event_id="ref-5"))
+    mails.clear()
+    procesar_en_background(payload(event_id="ref-6"))  # misma TRK-999
+
+    assert len(mails) == 1, "el operador tiene que enterarse de que no se creo"
+    assert "NO creado" in mails[0]["Subject"]
+    assert "a mano" in mails[0].get_content()
+
+
+def test_con_off_ni_se_consulta(mails, monkeypatch):
+    monkeypatch.setattr(config, "DUPLICATE_REFERENCE_ACTION", "off")
+    cli = ClienteFalso()
+    listener.return_service.client = cli
+
+    procesar_en_background(payload(event_id="ref-7"))
+    procesar_en_background(payload(event_id="ref-8"))  # misma TRK-999
+
+    assert len(cli.hizo("create_return")) == 2
+    assert mails == []
 
 
 # -------------------------------------------------------------------- /health

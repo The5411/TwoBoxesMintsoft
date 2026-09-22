@@ -191,11 +191,19 @@ def _identificar_return(data):
 
 
 def _avisar_duplicado_por_reference(reference, previos):
-    """Avisa que otro evento ya creó un return con esta misma Reference.
+    """Registra que otro evento ya creó un return con esta misma Reference.
 
     Es la segunda red de idempotencia: el claim del store frena el MISMO evento,
     y esto detecta un evento DISTINTO que apunta al mismo return (por ejemplo un
     payload reeditado a mano, o Two Boxes reemitiendo con otro id).
+
+    **Con `warn` no manda mail, solo loguea.** Una misma orden puede tener dos
+    devoluciones legítimas en momentos distintos -- y ahí la Reference cae al
+    número de orden --, así que este aviso daba muchos falsos positivos y el mail
+    no aportaba sobre la línea de log.
+
+    Con `block` sí manda mail, y eso no es negociable: ahí el return NO se crea,
+    y un return que no se crea sin que nadie se entere es una devolución perdida.
     """
     detalle = ", ".join(
         f"return {p.get('return_id')} ({p.get('return_kind')}) del evento "
@@ -208,27 +216,26 @@ def _avisar_duplicado_por_reference(reference, previos):
         f"DUPLICATE_REFERENCE_ACTION={config.DUPLICATE_REFERENCE_ACTION!r} -> "
         f"{'NO se procesa' if bloquear else 'se procesa igual'}."
     )
+
+    if not bloquear:
+        # Solo log: ver el docstring.
+        return True
+
     _send_alert_email(
-        subject=f"[Mintsoft] Posible return duplicado - PO {reference}",
+        subject=f"[Mintsoft] Return NO creado, Reference duplicada - PO {reference}",
         body=(
             f"Llego un webhook NUEVO cuya Reference ({reference}) ya tiene un return "
             f"creado en Mintsoft:\n\n  {detalle}\n\n"
-            + (
-                "No se proceso en Mintsoft (DUPLICATE_REFERENCE_ACTION=block), asi "
-                "que no se creo un segundo return. Si esta devolucion es legitima y "
-                "distinta de la anterior, hay que cargarla a mano.\n\n"
-                if bloquear else
-                "SE PROCESO igual (DUPLICATE_REFERENCE_ACTION=warn), asi que puede "
-                "haber quedado un segundo return con el mismo stock. Revisar los dos "
-                "returns en Mintsoft y anular el que sobre.\n\n"
-                "Para que estos casos NO se procesen, poner "
-                "DUPLICATE_REFERENCE_ACTION=block.\n\n"
-            )
-            + f"Una misma orden puede tener dos devoluciones legitimas en momentos "
-              f"distintos, por eso esto es un aviso y no un error."
+            f"NO se proceso en Mintsoft (DUPLICATE_REFERENCE_ACTION=block), asi que "
+            f"no se creo un segundo return.\n\n"
+            f"Si esta devolucion es legitima y distinta de la anterior, hay que "
+            f"cargarla a mano: una misma orden puede tener dos devoluciones en "
+            f"momentos distintos, y en ese caso la Reference es la misma.\n\n"
+            f"Para que estos casos se procesen igual (y revisarlos despues en "
+            f"Mintsoft), poner DUPLICATE_REFERENCE_ACTION=warn."
         ),
     )
-    return not bloquear
+    return False
 
 
 def procesar_webhook(data, event_key=None):
