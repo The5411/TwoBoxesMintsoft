@@ -277,3 +277,32 @@ def test_health_degradado_si_el_store_esta_caido(monkeypatch):
     r = listener.app.test_client().get("/health")
     assert r.status_code == 503
     assert r.get_json()["status"] == "degraded"
+
+
+def test_el_store_se_recupera_solo_cuando_la_base_vuelve(mails, monkeypatch):
+    """Un corte momentaneo no puede dejar el servicio rechazando para siempre.
+
+    Antes, la primera operacion fallida dejaba el flag de disponibilidad en False
+    y nadie lo volvia a poner en True: con REQUIRE_STORE=true el servicio seguia
+    sin escribir en Mintsoft mucho despues de que la base se recuperara.
+    """
+    cli = ClienteFalso()
+    listener.return_service.client = cli
+    monkeypatch.setattr(config, "REQUIRE_STORE", True)
+
+    conectar_real = listener.event_store._conectar
+    monkeypatch.setattr(
+        listener.event_store, "_conectar",
+        lambda: (_ for _ in ()).throw(RuntimeError("connection refused")),
+    )
+    procesar_en_background(payload(event_id="corte-1"))
+    assert cli.llamadas == [], "con la base caida no se escribe en el WMS"
+    assert listener.event_store.disponible is False
+
+    # La base vuelve.
+    monkeypatch.setattr(listener.event_store, "_conectar", conectar_real)
+    assert listener.event_store.disponible is True, "tiene que reintentar, no recordar"
+
+    mails.clear()
+    procesar_en_background(payload(event_id="corte-2"))
+    assert cli.hizo("create_return"), "con la base de vuelta se procesa normal"

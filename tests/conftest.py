@@ -104,10 +104,27 @@ def sin_red(monkeypatch, red_bloqueada):
     import mappers.mintsoft_mapper as mm
     mm._alert_last_sent.clear()
 
+    # En produccion las alertas se mandan en un thread aparte para no bloquear el
+    # thread que procesa el return. En los tests se mandan inline: si no, una
+    # asercion sobre `mails` correria antes que el envio y el test seria una
+    # carrera. El throttle -- que es lo que decide CUANTOS mails salen -- se
+    # evalua sincronicamente en los dos casos, asi que esto no cambia lo que se
+    # esta probando.
+    class EjecutorInline:
+        def submit(self, fn, *a, **k):
+            fn(*a, **k)
+
+    monkeypatch.setattr(mm, "_ejecutor_alertas", EjecutorInline())
+
     import listener
     # Cada test arranca con el store vacio: si no, el claim del segundo test ve
     # el evento del primero y no procesa nada.
     limpiar_store(listener.event_store)
+    # El rate limit tambien es estado de modulo: sin limpiarlo, un test que postea
+    # muchas veces gasta la ventana del siguiente.
+    listener._golpes.clear()
+    from loggers.main_logger import limpiar_correlacion
+    limpiar_correlacion()
     respuesta_ok = type("R", (), {
         "status_code": 200,
         "raise_for_status": lambda self: None,
@@ -149,6 +166,44 @@ def limpiar_store(store):
             con.commit()
         finally:
             con.close()
+
+
+class capturar_logs:
+    """Context manager que junta las lineas de un logger del proyecto.
+
+    caplog no sirve acá: los loggers tienen propagate=False para que gunicorn no
+    duplique cada linea, asi que nunca llegan al root logger donde caplog
+    engancha. Leer el stdout capturado tampoco es confiable, porque el
+    StreamHandler se queda con el sys.stdout del momento del import y las
+    capturas anidadas de pytest no lo ven.
+    """
+
+    def __init__(self, nombre, nivel=None):
+        import logging
+        self.logger = logging.getLogger(nombre)
+        self.nivel = nivel if nivel is not None else logging.DEBUG
+        self.lineas = []
+
+    def __enter__(self):
+        import logging
+
+        lineas = self.lineas
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                lineas.append(record.getMessage())
+
+        self.handler = Handler(level=self.nivel)
+        self.logger.addHandler(self.handler)
+        return self
+
+    def __exit__(self, *a):
+        self.logger.removeHandler(self.handler)
+        return False
+
+    @property
+    def texto(self):
+        return "\n".join(self.lineas)
 
 
 def drenar_pools():

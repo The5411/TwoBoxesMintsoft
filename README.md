@@ -103,7 +103,8 @@ quedaba encolado detrás del archivado. Se dimensionan con `WORKERS_MINTSOFT` y
 ## Estructura del repositorio
 
 ```
-listener.py                       App Flask, auth, idempotencia, dispatch de threads
+listener.py                       App Flask, auth, rate limit, idempotencia, dispatch
+reprocesar.py                     CLI: listar / ver / correr / cerrar eventos pendientes
 config.py                         Toda la configuración: ids de location, reasons,
                                   estados returnables, pools, flags del store
 Procfile                          Entrypoint de gunicorn
@@ -121,7 +122,7 @@ storage/
 loggers/
   main_logger.py                  Factory de logger a stdout
 models/                           Payloads de ejemplo capturados y datos de referencia de Mintsoft (ver abajo)
-tests/                            107 tests (pytest). Corren en CI, sin tocar la red:
+tests/                            137 tests (pytest). Corren en CI, sin tocar la red:
                                   un guard de sockets lo hace cumplir.
 .github/workflows/ci.yml          Compila todo + corre los tests en cada push y PR
 ```
@@ -170,6 +171,9 @@ deploy. Antes las locations aparecían hardcodeadas en cinco bloques distintos d
 | `MISSING_DISPOSITION` | `Missing` | Disposition de la unidad que nunca llegó. |
 | `RETURN_REASON_GOOD` / `RETURN_REASON_QUARANTINE` | `1` / `2` | `ReturnReasonId` de Mintsoft. |
 | `REFERENCE_MAX_LEN` | `50` | Largo máximo de `Reference` que acepta Mintsoft. |
+| `PRODUCT_DEFAULT_WEIGHT` | `0` | `Weight` con el que se da de alta un SKU inexistente. Placeholder: el payload no trae el peso. |
+| `PRODUCT_CREATE_SLEEP_SECONDS` | `3` | Pausa tras un alta de producto. El default es el comportamiento histórico; se paga dentro del thread que procesa el return. |
+| `RATE_LIMIT_PER_MINUTE` | `600` | `POST /webhook` por minuto y por IP. `0` lo desactiva. **Por proceso**: con `--workers 2` el límite efectivo es el doble. |
 | `MAX_CONTENT_LENGTH` | `5242880` | Tamaño máximo del body, rechazado antes de parsearlo. |
 
 **Notificaciones, pools y runtime**
@@ -245,6 +249,7 @@ python3 -m pytest tests/ -q
 | `400` | Body ausente o JSON no parseable |
 | `401` | Header de auth ausente o incorrecto |
 | `413` | Body más grande que `MAX_CONTENT_LENGTH` |
+| `429` | Más de `RATE_LIMIT_PER_MINUTE` requests por minuto desde esa IP. Trae `Retry-After: 60`, y el reintento es seguro: la idempotencia impide que cree un segundo return. |
 
 Un `200` puede significar cuatro cosas distintas, y el log lo dice en cada caso: se encoló
 para procesar, el `event_type` no está soportado, el evento ya se había procesado, o el store
@@ -347,6 +352,40 @@ que nadie se entere es una devolución perdida.
 SQLite abre en modo WAL para que los dos workers de gunicorn puedan leer mientras uno
 escribe. Alcanza para que `--workers 2` no duplique, pero **no** para sobrevivir un deploy:
 si el reproceso de un evento viejo tiene que estar protegido, hace falta `DATABASE_URL`.
+
+### En qué punto quedó un evento
+
+Además del estado, cada fila guarda el **paso** de la cadena de escritura hasta donde llegó:
+`recibido` → `return_creado` → `items_agregados` / `items_ubicados` → `stock_movido`. Es lo que
+distingue "esto no llegó a tocar Mintsoft, reprocesalo" de "el return existe pero le falta el
+movimiento de stock, completalo a mano".
+
+Al arrancar, el servicio marca como **`interrupted`** todo claim que haya quedado abierto más de
+`CLAIM_STALE_SECONDS`. Eso es lo que permite contestar *"¿qué se perdió en el último reinicio?"*,
+que antes no se podía: un evento que moría a mitad quedaba en `claimed` para siempre y era
+indistinguible de uno en curso. El barrido **no** toca claims recientes, a propósito: con varios
+workers, uno que reinicia no puede pisar un evento que otro está procesando en ese momento.
+
+### El comando de reproceso
+
+```bash
+python3 reprocesar.py listar                     # qué quedó pendiente
+python3 reprocesar.py ver <event_key>            # el detalle, con el payload
+python3 reprocesar.py correr <event_key>         # rehacerlo
+python3 reprocesar.py cerrar <event_key> "nota"  # darlo por resuelto a mano
+```
+
+Es un comando y no un endpoint: reprocesar escribe en el WMS, y no hace falta exponer eso en la
+red para que lo use quien ya tiene acceso al servidor. No re-archiva en Google Drive — llama
+directo a la operación de negocio, sin pasar por el handler HTTP.
+
+**`correr` nunca crea un segundo return.** Si el evento ya tiene `return_id`, se niega y dice que
+hay que completarlo a mano desde Mintsoft; si otro worker lo está procesando, tampoco arranca.
+Sólo reprocesa lo que no llegó a escribir nada.
+
+El procedimiento operativo es el de la sección 5.1 del plan: listar los pendientes, verificar en
+Mintsoft el estado real de cada uno, reprocesar los que no escribieron nada y cerrar a mano los
+que sí.
 
 ### Qué cambió para operar
 
@@ -549,20 +588,34 @@ if product_id == None:
         return sku, None
 ```
 
-**Qué pasa con los casos que caen acá.** Si el barcode tiene 7 caracteres o menos, `get_product_id`
-devuelve `(sku, None)` sin intentar el fallback, y el flujo sigue con `product_id = None`:
+**El fallback se intenta con todos los barcodes, sin importar el largo.** No hay ningún filtro
+por cantidad de caracteres: si la búsqueda por SKU no encontró producto y hay un barcode, se
+consulta `SearchBarcode`. Es el comportamiento vigente y el que viene funcionando en producción.
 
-- **Return externo** (`create_return`, `services/mintsoft_service.py:247`): se crea un producto
-  nuevo al vuelo con `PUT /api/Product`, así que en Mintsoft aparece un producto duplicado con el
-  SKU que mandó Two Boxes.
-- **Return interno** (`add_return_items`): el item se agrega con `ProductId: None`.
+> Versiones anteriores de este README describían un guard que descartaba los barcodes de 7
+> caracteres o menos antes de llamar al fallback. **Ese guard nunca existió en el código.** Se
+> deja constancia porque el texto anterior podía llevar a diagnosticar mal un SKU resuelto por
+> barcode.
 
-En ninguno de los dos casos el proceso se detiene ni se reporta un error de SKU específico
-(no hay un código tipo `SKU_NOT_RESOLVABLE`). **Estos casos se corrigen a mano en Mintsoft**: nos
-llegan por mail (aviso del merchant / del equipo de depósito), se identifica el SKU real y se
-arregla el return y el stock manualmente. Es un volumen bajo y asumido — la alternativa sería
-mandar el barcode corto a `SearchBarcode` y arriesgarse a imputar el return al producto
-equivocado, que es un error mucho más difícil de detectar después.
+**Cuándo queda `product_id = None`.** Si `SearchBarcode` no resuelve nada — devuelve `"null"` —
+o si el SKU que devuelve tampoco existe en `Product/Search`, el flujo sigue con
+`product_id = None`:
+
+- **Return externo** (`create_return`): se crea un producto nuevo al vuelo con
+  `PUT /api/Product`, así que en Mintsoft aparece un producto duplicado con el SKU que mandó
+  Two Boxes. Si esa creación también falla, el return **no** se crea y el mail nombra el SKU.
+- **Return interno** (`add_return_items`): el item se cae del return y se reporta en el mail,
+  con el detalle `items_agregados` / `items_en_el_payload` / `items_caidos`.
+
+**Estos casos se corrigen a mano en Mintsoft**: nos llegan por mail, se identifica el SKU real y
+se arregla el return y el stock manualmente. Es un volumen bajo y asumido.
+
+**El riesgo que esto deja abierto.** `SearchBarcode` puede matchear de forma parcial, así que un
+barcode corto o poco distintivo puede resolver a un SKU que no es el que volvió. En ese caso el
+return queda imputado al producto equivocado y el stock se mueve mal, sin que ningún paso falle
+— no hay mail, porque para el sistema salió todo bien. Es la contrapartida asumida de resolver
+el máximo de SKUs automáticamente. Si alguna vez aparece un return con un SKU que el merchant no
+reconoce, este es el primer lugar donde mirar.
 
 > El `barcode` se normaliza a string antes de medirlo. Cuando venía `None`, `len(barcode)`
 > lanzaba `TypeError: object of type 'NoneType' has no len()`; en `add_return_items` esa
@@ -694,8 +747,21 @@ Mintsoft son de un solo intento.
 el formato:
 
 ```
-%(asctime)s | %(levelname)s | %(name)s | %(message)s
+%(asctime)s | %(levelname)s | %(name)s | [<id de correlación>] %(message)s
 ```
+
+Todas las líneas de un mismo webhook llevan el mismo **id de correlación** (la clave de
+idempotencia del evento), así que se puede seguir un return por los logs sin cruzar timestamps a
+ojo:
+
+```
+2026-09-28 15:12:20 | INFO | listener | [id:abc-123] create_return -> (555, 'Internal Return Created')
+2026-09-28 15:12:20 | INFO | mintsoft_service | [id:abc-123] Confirmed return 555
+```
+
+El prefijo aparece **sólo** cuando hay un id seteado, así que las líneas de arranque y las de
+`/health` quedan exactamente como antes. Se limpia al terminar cada webhook, porque los threads
+del pool se reusan.
 
 Los loggers son `listener`, `mintsoft_service`, `mintsoft_client`, `mintsoft_mapper` y
 `event_store`. **Todo el diagnóstico pasa por el logger**: no quedan `print()` sueltos, así
@@ -725,7 +791,7 @@ en CI.
 | `mintsoft_orders_model.json` | Respuesta de ejemplo de `/api/Order/List` |
 | `mintsoft_order_status_model.json` | Ids de estado de orden (origen del filtro `[4, 5, 6]`) |
 | `mintsoft_return_reasons_model.json` | Ids de return reason (origen de las razones `1` y `2`) |
-| `mintsoft_warehouse_locations_model.json` | Todas las ubicaciones de depósito — de acá salen `4104` / `4299` / `9` / `4304` |
+| `mintsoft_warehouse_locations_model.json` | Las cuatro locations de returns que usa el código, con su rol. **Reemplazó un volcado de 1.353 filas y 428 KB** que no documentaba lo que decía: sólo traía el warehouse 3 y no contenía `4104`, `4299` ni `4304`. El volcado completo sigue en el historial de git. |
 | `mintsoft_products_in_locations_model.json` | Ejemplo del reporte de productos por ubicación |
 
 ---

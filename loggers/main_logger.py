@@ -1,8 +1,39 @@
 import logging
 import os
 import sys
+import threading
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# --- Id de correlacion (E-7) --------------------------------------------------
+# Todas las lineas de un mismo webhook llevan el mismo id, asi que se puede
+# seguir un return por los logs sin cruzar timestamps a ojo. Es thread-local
+# porque cada webhook se procesa entero en un thread del pool.
+#
+# Se agrega como prefijo SOLO cuando hay uno seteado, asi que las lineas de
+# arranque y las de /health siguen exactamente igual que antes.
+_contexto = threading.local()
+
+
+def set_correlacion(valor) -> None:
+    _contexto.cid = valor
+
+
+def limpiar_correlacion() -> None:
+    """Obligatorio al terminar: los threads del pool se reusan, y sin esto el
+    id del webhook anterior se pegaria a las lineas del siguiente."""
+    _contexto.cid = None
+
+
+def get_correlacion():
+    return getattr(_contexto, "cid", None)
+
+
+class _FiltroCorrelacion(logging.Filter):
+    def filter(self, record):
+        cid = get_correlacion()
+        record.cid = f"[{cid}] " if cid else ""
+        return True
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -24,8 +55,9 @@ def get_logger(name: str, filename: str = None) -> logging.Logger:
         return logger
 
     handler = logging.StreamHandler(sys.stdout)
+    handler.addFilter(_FiltroCorrelacion())
     handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(cid)s%(message)s")
     )
     logger.addHandler(handler)
     # Sin propagar: el root logger de gunicorn duplicaria cada linea.

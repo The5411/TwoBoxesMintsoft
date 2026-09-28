@@ -204,6 +204,25 @@ REFERENCE_MAX_LEN = _env_int("REFERENCE_MAX_LEN", 50)
 # configurable por si hace falta otro valor.
 PRODUCT_DEFAULT_WEIGHT = _env_float("PRODUCT_DEFAULT_WEIGHT", 0.0)
 
+# Pausa despues de dar de alta un producto, para no saturar la API de Mintsoft.
+# El default es 3 segundos, que es exactamente lo que hacia el codigo antes: el
+# objetivo de sacarlo a configuracion es poder bajarlo sin deploy si hiciera
+# falta, no cambiar el comportamiento actual. Ojo que se paga dentro del thread
+# que procesa el return, asi que son 3 segundos por SKU nuevo.
+PRODUCT_CREATE_SLEEP_SECONDS = _env_float("PRODUCT_CREATE_SLEEP_SECONDS", 3.0)
+
+
+# --- Rate limit del endpoint (E-8) --------------------------------------------
+# Maximo de POST /webhook por minuto y por IP de origen. 0 lo desactiva.
+#
+# El default es holgado a proposito: el volumen real son unos pocos webhooks por
+# minuto, asi que 600 no puede interferir con la operacion normal ni siquiera
+# durante una reemision masiva de Two Boxes. Esta para frenar un bucle o un
+# escaneo, no para moderar a Two Boxes.
+#
+# Es por proceso: con `--workers 2` el limite efectivo es el doble.
+RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", 600)
+
 
 # --- Webhook ------------------------------------------------------------------
 EVENT_TYPES_SOPORTADOS = _env_set("EVENT_TYPES", "return-complete")

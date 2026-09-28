@@ -47,6 +47,19 @@ ESTADO_EN_PROCESO = "claimed"
 ESTADO_PROCESADO = "processed"
 ESTADO_FALLADO = "failed"
 ESTADO_IGNORADO = "ignored"
+# Un evento que quedo en_proceso cuando el worker murio. Lo marca el barrido de
+# arranque (marcar_interrumpidos), no el procesamiento: es la unica forma de
+# saber DESPUES de un reinicio que ese evento quedo a medias.
+ESTADO_INTERRUMPIDO = "interrupted"
+
+# Pasos de la cadena de escritura en Mintsoft (E-1.4). Se graban a medida que el
+# evento avanza, asi que un evento a medias dice en que punto quedo: es la
+# diferencia entre "hay que reprocesarlo" y "hay que completarlo a mano".
+PASO_RECIBIDO = "recibido"
+PASO_RETURN_CREADO = "return_creado"
+PASO_ITEMS_AGREGADOS = "items_agregados"
+PASO_ITEMS_UBICADOS = "items_ubicados"
+PASO_STOCK_MOVIDO = "stock_movido"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS webhook_events (
@@ -62,6 +75,7 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     attempts     INTEGER NOT NULL DEFAULT 1,
     last_error   TEXT,
     payload      TEXT,
+    step         TEXT,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 )
@@ -76,8 +90,12 @@ _INDICES = (
 _COLUMNAS = (
     "event_key", "event_id", "payload_hash", "event_type", "merchant",
     "reference", "status", "return_id", "return_kind", "attempts",
-    "last_error", "payload", "created_at", "updated_at",
+    "last_error", "payload", "step", "created_at", "updated_at",
 )
+
+# Columnas agregadas despues de la primera version de la tabla. Se agregan con
+# ALTER TABLE al inicializar, para no romper una base ya creada.
+_COLUMNAS_AGREGADAS = (("step", "TEXT"),)
 
 
 def _ahora() -> str:
@@ -199,6 +217,7 @@ class EventStore:
                 try:
                     cur = con.cursor()
                     cur.execute(_DDL)
+                    self._migrar_columnas(cur)
                     for indice in _INDICES:
                         cur.execute(indice)
                     con.commit()
@@ -217,8 +236,122 @@ class EventStore:
                 logger.error(f"No se pudo inicializar el store de eventos: {e}", exc_info=True)
             return self._init_ok
 
+    def _columnas_existentes(self, cur) -> set:
+        """Nombres de columna de webhook_events, en los dos backends."""
+        if self.es_postgres:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'webhook_events'"
+            )
+            return {str(f[0]) for f in cur.fetchall()}
+        cur.execute("PRAGMA table_info(webhook_events)")
+        return {str(f[1]) for f in cur.fetchall()}
+
+    def _migrar_columnas(self, cur) -> None:
+        """Agrega las columnas nuevas a una tabla que ya existe.
+
+        Sin esto, una base creada por una version anterior no tiene la columna
+        `step` y todo SELECT falla, porque _COLUMNAS la incluye.
+        """
+        existentes = self._columnas_existentes(cur)
+        for nombre, tipo in _COLUMNAS_AGREGADAS:
+            if nombre in existentes:
+                continue
+            cur.execute(f"ALTER TABLE webhook_events ADD COLUMN {nombre} {tipo}")
+            logger.info(f"Store: columna {nombre!r} agregada a webhook_events")
+
+    def marcar_interrumpidos(self, antiguedad_segundos: Optional[int] = None) -> int:
+        """Marca como interrumpidos los claims que quedaron abiertos (E-1.6).
+
+        Se llama al arrancar. Es lo que permite responder "que se perdio en el
+        ultimo reinicio", que hasta ahora no se podia contestar: un evento que
+        moria a mitad quedaba en 'claimed' para siempre y era indistinguible de
+        uno que se esta procesando ahora.
+
+        **Solo toca claims mas viejos que la ventana de CLAIM_STALE_SECONDS.** Es
+        deliberado: con varios workers, uno que reinicia no puede marcar como
+        interrumpido un evento que OTRO worker esta procesando en este momento. Un
+        webhook tarda segundos, asi que nada vivo tiene media hora de antiguedad.
+
+        Devuelve cuantas filas marco. Nunca lanza.
+        """
+        if antiguedad_segundos is None:
+            antiguedad_segundos = config.CLAIM_STALE_SECONDS
+        corte = (
+            datetime.now(timezone.utc) - timedelta(seconds=antiguedad_segundos)
+        ).isoformat()
+        try:
+            with self._lock:
+                con = self._conectar()
+                try:
+                    cur = con.cursor()
+                    cur.execute(
+                        self._sql(
+                            "UPDATE webhook_events SET status = ?, updated_at = ? "
+                            "WHERE status = ? AND updated_at < ?"
+                        ),
+                        (ESTADO_INTERRUMPIDO, _ahora(), ESTADO_EN_PROCESO, corte),
+                    )
+                    cantidad = cur.rowcount
+                    con.commit()
+                finally:
+                    con.close()
+        except Exception as e:
+            logger.error(f"El barrido de eventos interrumpidos fallo: {e}")
+            return 0
+
+        if cantidad:
+            logger.warning(
+                f"{cantidad} evento(s) quedaron a medias en un reinicio anterior y "
+                f"se marcaron como {ESTADO_INTERRUMPIDO!r}. Revisarlos con "
+                f"`python3 reprocesar.py listar`."
+            )
+        return cantidad
+
+    def listar(self, estados=None, limite: int = 50) -> List[Dict[str, Any]]:
+        """Eventos por estado, del mas reciente al mas viejo. Para el CLI."""
+        estados = list(estados or [ESTADO_FALLADO, ESTADO_INTERRUMPIDO])
+        marcas = ", ".join("?" for _ in estados)
+        try:
+            with self._lock:
+                con = self._conectar()
+                try:
+                    cur = con.cursor()
+                    cur.execute(
+                        self._sql(
+                            f"SELECT {', '.join(_COLUMNAS)} FROM webhook_events "
+                            f"WHERE status IN ({marcas}) "
+                            f"ORDER BY updated_at DESC LIMIT {int(limite)}"
+                        ),
+                        tuple(estados),
+                    )
+                    filas = cur.fetchall()
+                    con.commit()
+                finally:
+                    con.close()
+        except Exception as e:
+            logger.error(f"listar() fallo: {e}")
+            return []
+        return [self._fila_a_dict(f) for f in filas]
+
+    def _marcar_sano(self) -> None:
+        """Una operacion que funciono prueba que la base esta viva."""
+        if not self._init_ok:
+            logger.info("El store de eventos volvio a responder.")
+        self._init_ok = True
+        self._ultimo_error = None
+
     @property
     def disponible(self) -> bool:
+        """Si la base responde, reintentando la conexion si la ultima fallo.
+
+        Reintenta a proposito: un corte momentaneo marcaba el store como caido y
+        ese flag no se limpiaba nunca, asi que con REQUIRE_STORE=true el servicio
+        seguia rechazando webhooks mucho despues de que la base se recuperara.
+        Solo hacia falta que una operacion fallara una vez.
+        """
+        if not self._init_ok:
+            self.inicializar()
         return self._init_ok
 
     @property
@@ -284,16 +417,18 @@ class EventStore:
                         self._sql(
                             "INSERT INTO webhook_events ("
                             " event_key, event_id, payload_hash, event_type, merchant,"
-                            " reference, status, attempts, payload, created_at, updated_at"
-                            ") VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?) "
+                            " reference, status, attempts, payload, step, created_at,"
+                            " updated_at"
+                            ") VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?) "
                             "ON CONFLICT (event_key) DO NOTHING"
                         ),
                         (clave, str(event_id) if event_id is not None else None, huella,
                          event_type, merchant, reference, ESTADO_EN_PROCESO,
-                         payload_txt, ahora, ahora),
+                         payload_txt, PASO_RECIBIDO, ahora, ahora),
                     )
                     if cur.rowcount == 1:
                         con.commit()
+                        self._marcar_sano()
                         return Veredicto(True, "nuevo", {"event_key": clave})
 
                     # 2. Ya existe: hay que mirar en que estado quedo.
@@ -392,6 +527,21 @@ class EventStore:
             f"record_return({event_key}, {return_id})",
         )
 
+    def record_step(self, event_key: str, step: str) -> bool:
+        """Deja constancia de hasta donde llego el evento (E-1.4).
+
+        No cambia el estado: un evento puede estar 'failed' en el paso
+        'return_creado', y eso es justo lo que hay que saber para decidir entre
+        reprocesar y completar a mano.
+        """
+        if not event_key:
+            return False
+        return self._actualizar(
+            "UPDATE webhook_events SET step = ?, updated_at = ? WHERE event_key = ?",
+            (step, _ahora(), event_key),
+            f"record_step({event_key}, {step})",
+        )
+
     def finish(self, event_key: str, status: str, error: Optional[str] = None) -> bool:
         """Cierra el evento como procesado, fallado o ignorado."""
         return self._actualizar(
@@ -423,6 +573,7 @@ class EventStore:
                     cur = con.cursor()
                     cur.execute(self._sql(sql), parametros)
                     con.commit()
+                    self._marcar_sano()
                     return cur.rowcount >= 1
                 finally:
                     con.close()
@@ -490,6 +641,7 @@ class EventStore:
                     con.commit()
                 finally:
                     con.close()
+            self._marcar_sano()
             return {
                 "backend": self.backend,
                 "disponible": True,

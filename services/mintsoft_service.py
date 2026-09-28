@@ -608,8 +608,11 @@ class MintsoftReturnService:
                 f"no tiene ProductId. El return no se crea: hay que dar de alta el "
                 f"SKU a mano."
             )
-        # Sleep corto para no saturar la API despues de un alta.
-        time.sleep(3)
+        # Pausa para no saturar la API despues de un alta. Sale de configuracion
+        # (default 3s, igual que antes) porque se paga dentro del thread que
+        # procesa el return: son 3 segundos por SKU nuevo.
+        if config.PRODUCT_CREATE_SLEEP_SECONDS > 0:
+            time.sleep(config.PRODUCT_CREATE_SLEEP_SECONDS)
         cache[clave] = (sku, product_id)
         return sku, product_id
 
@@ -633,7 +636,7 @@ class MintsoftReturnService:
         if self.client.check_carton(carton_code):
             return
         self.logger.info(f"Caja {carton_code!r} no esta en Mintsoft: se crea.")
-        self.client.create_carton(
+        respuesta = self.client.create_carton(
             {
                 "WarehouseId": warehouse,
                 "StorageMediaName": "Stock",
@@ -641,7 +644,24 @@ class MintsoftReturnService:
                 "LocationId": config.location_id(warehouse, buen_estado=True),
             },
             client_id,
-        )
+        ) or {}
+
+        # C-2 -- la respuesta se miraba y se tiraba. El transfer sigue usando el
+        # put_away_bin del payload (es el codigo que el operario escaneo y pego en
+        # la caja fisica), pero si Mintsoft dice haber creado OTRO codigo, eso hay
+        # que verlo: significa que el destino del transfer y la caja real no son
+        # la misma, y el transfer va a fallar sin explicar por que.
+        creado = respuesta.get("Code") or respuesta.get("CartonCode")
+        if creado and str(creado).strip().upper() != carton_code.strip().upper():
+            self.logger.error(
+                f"Mintsoft creo la caja con el codigo {creado!r}, distinto del "
+                f"put_away_bin {carton_code!r} que se va a usar como destino del "
+                f"TransferStock. Revisar: el stock puede terminar en otra caja."
+            )
+        elif respuesta.get("ID"):
+            self.logger.info(
+                f"Caja {carton_code!r} creada (ID {respuesta.get('ID')})."
+            )
 
     def _get_merchant_name(self, data) -> str:
         """Nombre del merchant, buscándolo en los tres lugares donde puede venir.

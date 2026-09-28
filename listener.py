@@ -10,6 +10,8 @@ Responsabilidades, en orden de importancia:
 """
 import hmac
 import os
+import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
@@ -22,13 +24,17 @@ from urllib3.util.retry import Retry
 load_dotenv()
 
 import config
-from loggers.main_logger import get_logger
+from loggers.main_logger import get_logger, limpiar_correlacion, set_correlacion
 from mappers.mintsoft_mapper import _send_alert_email
 from services.mintsoft_service import MintsoftReturnService
 from storage.event_store import (
     ESTADO_FALLADO,
     ESTADO_IGNORADO,
     ESTADO_PROCESADO,
+    PASO_ITEMS_AGREGADOS,
+    PASO_ITEMS_UBICADOS,
+    PASO_RETURN_CREADO,
+    PASO_STOCK_MOVIDO,
     EventStore,
 )
 
@@ -43,6 +49,12 @@ return_service = MintsoftReturnService()
 # `disponible = False` y el handler lo trata como tal.
 event_store = EventStore()
 return_service.store = event_store
+
+# E-1.6 -- Al arrancar, marcar como interrumpido lo que quedo en vuelo. Es lo que
+# permite responder "que se perdio en el ultimo reinicio", que antes no se podia
+# contestar. Solo toca claims mas viejos que CLAIM_STALE_SECONDS, asi que un
+# worker que reinicia no pisa un evento que otro worker esta procesando ahora.
+event_store.marcar_interrumpidos()
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 GAS_URL = os.environ.get("GAS_URL")
@@ -64,6 +76,7 @@ _metricas = {
     "duplicados": 0,
     "ignorados": 0,
     "sin_store": 0,
+    "rechazados_por_rate_limit": 0,
 }
 _metricas_lock = Lock()
 
@@ -71,6 +84,36 @@ _metricas_lock = Lock()
 def _contar(clave):
     with _metricas_lock:
         _metricas[clave] = _metricas.get(clave, 0) + 1
+
+
+# --- Rate limit (E-8) ----------------------------------------------------------
+# Ventana deslizante de un minuto por IP de origen. Es por proceso: con
+# `--workers 2` el limite efectivo es el doble, y por eso el default es holgado.
+# Devuelve 429, que Two Boxes puede reintentar -- y ahora el reintento es seguro,
+# porque la idempotencia impide que cree un segundo return.
+_golpes = {}
+_golpes_lock = Lock()
+
+
+def _rate_limit_excedido(ip) -> bool:
+    limite = config.RATE_LIMIT_PER_MINUTE
+    if not limite:
+        return False
+
+    ahora = time.monotonic()
+    corte = ahora - 60
+    with _golpes_lock:
+        cola = _golpes.setdefault(ip, deque())
+        while cola and cola[0] < corte:
+            cola.popleft()
+        # Se limpian las IPs inactivas para que el dict no crezca sin limite.
+        if len(_golpes) > 1000:
+            for otra in [k for k, v in _golpes.items() if not v]:
+                del _golpes[otra]
+        if len(cola) >= limite:
+            return True
+        cola.append(ahora)
+    return False
 
 
 # --- Pools ---------------------------------------------------------------------
@@ -238,9 +281,22 @@ def _avisar_duplicado_por_reference(reference, previos):
     return False
 
 
+def _paso(event_key, paso):
+    """Graba hasta donde llego el evento (E-1.4). Nunca rompe el procesamiento."""
+    if not event_key:
+        return
+    try:
+        event_store.record_step(event_key, paso)
+    except Exception as e:
+        logger.error(f"No se pudo grabar el paso {paso!r}: {e}")
+
+
 def procesar_webhook(data, event_key=None):
     # Un webhook = un mail. El reporte junta los problemas de todas las capas y se
     # manda una sola vez en el finally, en vez de un mail por capa que fallaba.
+    # Todas las lineas de este webhook quedan marcadas con el mismo id, asi que
+    # se puede seguir un return por los logs sin cruzar timestamps a ojo.
+    set_correlacion(event_key or _identificar_return(data) or "sin-id")
     return_service.begin_webhook_report(data, event_key=event_key)
     estado_final = ESTADO_FALLADO
     error_final = None
@@ -251,11 +307,14 @@ def procesar_webhook(data, event_key=None):
 
         # Pasar items de RET o RET-QT a la caja del return si es External
         if return_id[1] == "External Return Created":
+          _paso(event_key, PASO_RETURN_CREADO)
           # Pasar items a RET o RET-QT
           return_service.allocate_external_return_items(data, return_id[0])
+          _paso(event_key, PASO_ITEMS_UBICADOS)
 
           # Pasar items de RET o RET-QT a la caja del return si es External
           return_service.reallocate_return_items(data)
+          _paso(event_key, PASO_STOCK_MOVIDO)
 
         # Agregar items al return en caso de que sea interno
         if return_id[1] == "Internal Return Created":
@@ -266,6 +325,7 @@ def procesar_webhook(data, event_key=None):
             # sin confirmar. Quedaba mercaderia en una caja sin ningun return que la
             # respalde. Ahora, si el armado fallo, no se toca el stock: queda en el
             # staging, con el reporte diciendo que hay que completarlo a mano.
+            _paso(event_key, PASO_RETURN_CREADO)
             armado_ok = return_service.add_return_items(return_id[0], data)
 
             if armado_ok is False:
@@ -274,8 +334,10 @@ def procesar_webhook(data, event_key=None):
                     f"stock. Queda en RET / RET-TEMP esperando intervencion."
                 )
             else:
+                _paso(event_key, PASO_ITEMS_AGREGADOS)
                 # Pasar items de RET o RET-QT a la caja del return si es Internal
                 return_service.reallocate_return_items(data)
+                _paso(event_key, PASO_STOCK_MOVIDO)
 
         # No afirmar exito cuando no se creo nada: "Webhook procesado con exito"
         # se imprimia igual con (None, "No Return Created"), que es justo el caso
@@ -331,6 +393,9 @@ def procesar_webhook(data, event_key=None):
             return_service.flush_webhook_report()
         except Exception as flush_err:
             logger.error(f"No se pudo enviar el reporte del webhook: {flush_err}")
+        # Los threads del pool se reusan: sin esto el id de este webhook se
+        # pegaria a las lineas del siguiente.
+        limpiar_correlacion()
 
 
 @app.route("/webhook", methods=["POST"])
@@ -345,6 +410,17 @@ def webhook():
     if not token or not hmac.compare_digest(str(token), str(WEBHOOK_SECRET)):
         logger.warning(f"Unauthorized Access Request desde {request.remote_addr}")
         return jsonify({"error": "Unauthorized"}), 401
+
+    # Despues de autenticar a proposito: un request sin token valido ya se
+    # rechazo arriba, asi que el limite protege contra un emisor legitimo en
+    # bucle, no contra un desconocido.
+    if _rate_limit_excedido(request.remote_addr):
+        _contar("rechazados_por_rate_limit")
+        logger.warning(
+            f"Rate limit excedido desde {request.remote_addr} "
+            f"({config.RATE_LIMIT_PER_MINUTE}/min por proceso). Se devuelve 429."
+        )
+        return jsonify({"error": "Too Many Requests"}), 429, {"Retry-After": "60"}
 
     _contar("recibidos")
 
@@ -553,6 +629,7 @@ def health():
             "webhooks_url": bool(WEBHOOKS_URL),
             "require_store": config.REQUIRE_STORE,
             "duplicate_reference_action": config.DUPLICATE_REFERENCE_ACTION,
+            "rate_limit_per_minute": config.RATE_LIMIT_PER_MINUTE,
             "returnable_order_status_ids": sorted(config.RETURNABLE_ORDER_STATUS_IDS),
             "return_locations": {str(k): v for k, v in config.RETURN_LOCATIONS.items()},
         },

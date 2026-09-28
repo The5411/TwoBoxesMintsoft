@@ -2,11 +2,27 @@ import os
 import smtplib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 
 from loggers.main_logger import get_logger
 
 logger = get_logger("mintsoft_mapper")
+
+# --- S-6: el envio no bloquea al que lo pide ------------------------------------
+# map_client() es un mapper puro que se llama desde el thread que procesa el
+# return, y abria una conexion SMTP ahi mismo: hasta 15 segundos de un thread del
+# pool retenidos por una notificacion. Ahora el envio se encola en un thread
+# propio y el que llama sigue de largo.
+#
+# Un solo worker a proposito: los mails de alerta no necesitan paralelismo, y
+# serializarlos evita abrir varias conexiones SMTP a la vez.
+#
+# El throttle sigue evaluandose de forma sincronica, antes de encolar, asi que
+# que el envio sea asincronico no cambia CUANTOS mails salen.
+_ejecutor_alertas = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="alertas"
+)
 
 clients = [
   { "m_name": "Acler", "m_id": 19, "tb_name": "acler", "tb_rma_prov": "Work Capture", "warehouse_id": 3},
@@ -101,8 +117,11 @@ def _alert_allowed(subject: str):
 
 
 def _send_alert_email(subject: str, body: str) -> None:
-    """Manda un mail de alerta. Nunca lanza: un fallo de notificación no debe
-    romper al caller."""
+    """Encola un mail de alerta. Nunca lanza ni bloquea al que la pide.
+
+    El throttle se evalua acá, de forma sincronica, antes de encolar: que el
+    envio sea asincronico no cambia cuantos mails salen ni cuales.
+    """
     allowed, suppressed = _alert_allowed(subject)
     if not allowed:
         logger.info(
@@ -115,6 +134,15 @@ def _send_alert_email(subject: str, body: str) -> None:
             f"{body}\n\n---\nSe suprimieron {suppressed} alertas identicas en los "
             f"ultimos {_ALERT_WINDOW_SECONDS} segundos (throttle por proceso)."
         )
+    try:
+        _ejecutor_alertas.submit(_enviar_smtp, subject, body)
+    except Exception as e:
+        # Por ejemplo si el pool ya se apago durante un shutdown.
+        logger.error(f"No se pudo encolar la alerta {subject!r}: {e}")
+
+
+def _enviar_smtp(subject: str, body: str) -> None:
+    """El envio propiamente dicho. Corre en el thread de alertas."""
     try:
         smtp_host = os.environ.get("SMTP_HOST")
         smtp_port = int(os.environ.get("SMTP_PORT", "587"))
@@ -146,8 +174,11 @@ def _send_alert_email(subject: str, body: str) -> None:
                 pass
             server.login(smtp_user, smtp_password)
             server.send_message(msg)
-    except Exception:
-        pass
+    except Exception as e:
+        # Antes esto era un `pass` pelado. Ahora corre en un thread de fondo, asi
+        # que sin este log un SMTP mal configurado seria completamente invisible:
+        # nadie recibiria alertas y nadie sabria por que.
+        logger.error(f"No se pudo enviar la alerta {subject!r}: {e}")
 
 
 def _send_unmapped_client_email(tb_name: str) -> None:
